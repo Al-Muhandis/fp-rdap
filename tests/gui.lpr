@@ -3,7 +3,7 @@ program gui;
 {$mode objfpc}{$H+}
 
 uses
-  Interfaces, Forms, GuiTestRunner, test_rdapclient
+  Interfaces, Forms, GuiTestRunner, test_rdapclient, rdapclient
   ;
 
 {$R *.res}
