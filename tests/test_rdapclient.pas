@@ -5,35 +5,608 @@ unit test_rdapclient;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser, rdapclient
-  ;
+  Classes, SysUtils, fpcunit, testregistry, rdapclient;
+
+const
+  // Realistic subsets of the IANA bootstrap files (RFC 8524 / RFC 9224 / RFC 9225).
+  BootstrapDNS =
+    '{' +
+    '  "version": "1.0",' +
+    '  "publication": "2026-01-01T00:00:00Z",' +
+    '  "services": [' +
+    '    [["net", "com"], ["https://rdap.verisign.com/com/v1/", "https://rdap2.verisign.com/com/v1/"]],' +
+    '    [["org"], ["https://rdap.pir.org/"]],' +
+    '    [["co.uk", "org.uk"], ["https://rdap.nominet.uk/"]],' +
+    '    [["uk"], ["https://rdap.ukregistry.example/"]],' +
+    '    [["ru"], ["https://rdap.tcinet.ru/"]]' +
+    '  ]' +
+    '}';
+
+  BootstrapIPv4 =
+    '{' +
+    '  "version": "1.0",' +
+    '  "publication": "2026-01-01T00:00:00Z",' +
+    '  "services": [' +
+    '    [["8.0.0.0/8"], ["https://rdap.arin.net/registry/"]],' +
+    '    [["8.8.8.0/24"], ["https://rdap.lucky.example/"]],' +
+    '    [["192.0.2.0/24", "198.51.100.0/24"], ["https://rdap.test.example/"]],' +
+    '    [["203.0.113.0/24"], ["https://rdap.test2.example/"]]' +
+    '  ]' +
+    '}';
+
+  BootstrapIPv6 =
+    '{' +
+    '  "version": "1.0",' +
+    '  "publication": "2026-01-01T00:00:00Z",' +
+    '  "services": [' +
+    '    [["2001:db8::/32"], ["https://rdap.db8.example/"]],' +
+    '    [["2a00::/12"], ["https://rdap.ripe.example/"]],' +
+    '    [["2620:0:2d0::/48"], ["https://rdap.v6nic.example/"]]' +
+    '  ]' +
+    '}';
 
 type
+  { Base test case: keeps a list of temp files created by MakeFile and
+    deletes them in TearDown. }
 
-  { TTestRDAPClient }
-
-  TTestRDAPClient = class(TTestCase)
+  TRDAPTestCase = class(TTestCase)
   private
-    FClient: TRDAPClientMock;
-    FMockJSON: string;
-    FMockJSONIP: String;
+    FFiles: TStringList;
   protected
     procedure SetUp; override;
     procedure TearDown; override;
+    function MakeFile(const AContent: string): string;
+  end;
+
+  { TTestIPUtils - pure helper functions, no I/O }
+
+  TTestIPUtils = class(TRDAPTestCase)
+  published
+    procedure TestStrToIPv4_OK;
+    procedure TestStrToIPv4_Invalid;
+    procedure TestStrToIPv6_OK;
+    procedure TestStrToIPv6_Invalid;
+    procedure TestIPv4InNetwork;
+    procedure TestIPv4InNetwork_EdgePrefixes;
+    procedure TestIPv6InNetwork;
+    procedure TestDomainMatchesKey;
+    procedure TestEncodePathSegment;
+  end;
+
+  { TTestBootstrap - bootstrap file loading and server lookup }
+
+  TTestBootstrap = class(TRDAPTestCase)
+  private
+    FBootstrap: TRDAPBootstrap;
+  protected
+    procedure SetUp; override;
+    procedure TearDown; override;
+    procedure LoadAll;
+  published
+    procedure TestGetBaseURLForDomain;
+    procedure TestGetBaseURLForDomain_MultiLabelTLD;
+    procedure TestGetBaseURLForDomain_CaseInsensitive;
+    procedure TestGetBaseURLForDomain_NotFound;
+    procedure TestGetBaseURLForDomain_Reload;
+    procedure TestGetBaseURLForIP_IPv4;
+    procedure TestGetBaseURLForIP_IPv4_LongestPrefixWins;
+    procedure TestGetBaseURLForIP_IPv6;
+    procedure TestGetBaseURLForIP_Invalid;
+    procedure TestGetBaseURLForIP_NotFound;
+    procedure TestNotLoaded;
+    procedure TestLoadFromLocalFiles_SkipsEmptyNames;
+    procedure TestLoadFromLocalFiles_MissingFile;
+    procedure TestLoad_InvalidJSON;
+  end;
+
+  { TTestRDAPClient - client behaviour on a mocked network layer }
+
+  TTestRDAPClient = class(TRDAPTestCase)
+  private
+    FClient: TRDAPClientMock;
+    FMockJSON: string;
+    FMockJSONIP: string;
+  protected
+    procedure SetUp; override;
+    procedure TearDown; override;
+    function NewDNSBootstrap: TRDAPBootstrap;
   published
     procedure TestConstructor;
-    procedure TestQueryDomain;
-    procedure TestQueryIP;
-    procedure TestGetObjectTitle;
+    procedure TestQueryDomain_Mock;
+    procedure TestQueryDomain_BaseURLNormalized;
+    procedure TestQueryDomain_BaseURLOverridesBootstrap;
+    procedure TestQueryDomain_UsesBootstrapBaseURL;
+    procedure TestQueryDomain_NoBaseNoBootstrap;
+    procedure TestQueryDomain_EmptyDomain;
+    procedure TestQueryDomain_EncodesPath;
+    procedure TestQueryIP_Mock;
+    procedure TestQueryIP_IPv6;
+    procedure TestQueryIP_InvalidIP;
+    procedure TestQueryIP_UsesBootstrapBaseURL;
+    procedure TestQueryAutNum;
+    procedure TestQueryAutNum_NoBaseURL;
+    procedure TestQueryEntity;
+    procedure TestQueryEntity_EncodesPath;
+    procedure TestGetObjectTitle_PrefersHandle;
+    procedure TestGetObjectTitle_FallsBackToName;
     procedure TestGetObjectType;
-    procedure TestLastStatusNotFound;  
-    procedure TestGetTitleNotFound;
+    procedure TestLastStatusNotFound;
+    procedure TestNotFound_KeepsErrorBody;
+    procedure TestRateLimited;
+    procedure TestUnexpectedStatus_Raises;
+    procedure TestNetworkError_Wrapped;
+    procedure TestMalformed200JSON;
+    procedure TestMockRecordsRequests;
   end;
 
 implementation
 
+var
+  GFileCounter: Integer = 0;
+
+{ TRDAPTestCase }
+
+procedure TRDAPTestCase.SetUp;
+begin
+  inherited SetUp;
+  FFiles := TStringList.Create;
+end;
+
+procedure TRDAPTestCase.TearDown;
+var
+  I: Integer;
+begin
+  for I := 0 to FFiles.Count - 1 do
+    DeleteFile(FFiles[I]);
+  FFiles.Free;
+  inherited TearDown;
+end;
+
+function TRDAPTestCase.MakeFile(const AContent: string): string;
+begin
+  Inc(GFileCounter);
+  Result := GetTempDir(False) + Format('rdap-test-%d.json', [GFileCounter]);
+  FFiles.Add(Result);
+  with TStringList.Create do
+  try
+    Text := AContent;
+    SaveToFile(Result);
+  finally
+    Free;
+  end;
+end;
+
+{ TTestIPUtils }
+
+procedure TTestIPUtils.TestStrToIPv4_OK;
+var
+  IP: Cardinal;
+begin
+  AssertTrue('parse 8.8.8.8', TryStrToIPv4('8.8.8.8', IP));
+  AssertEquals(Int64($08080808), Int64(IP));
+  AssertTrue('parse 192.0.2.1', TryStrToIPv4('192.0.2.1', IP));
+  AssertEquals(Int64($C0000201), Int64(IP));
+  AssertTrue('parse 0.0.0.0', TryStrToIPv4('0.0.0.0', IP));
+  AssertEquals(0, Int64(IP));
+  AssertTrue('parse 255.255.255.255', TryStrToIPv4('255.255.255.255', IP));
+  AssertEquals(Int64($FFFFFFFF), Int64(IP));
+end;
+
+procedure TTestIPUtils.TestStrToIPv4_Invalid;
+var
+  IP: Cardinal;
+begin
+  AssertFalse('"256.1.1.1"', TryStrToIPv4('256.1.1.1', IP));
+  AssertFalse('"1.2.3"', TryStrToIPv4('1.2.3', IP));
+  AssertFalse('"1.2.3.4.5"', TryStrToIPv4('1.2.3.4.5', IP));
+  AssertFalse('"a.b.c.d"', TryStrToIPv4('a.b.c.d', IP));
+  AssertFalse('empty', TryStrToIPv4('', IP));
+  AssertFalse('"1..2.3"', TryStrToIPv4('1..2.3', IP));
+  AssertFalse('".1.2.3"', TryStrToIPv4('.1.2.3', IP));
+  AssertFalse('"1.2.3.4."', TryStrToIPv4('1.2.3.4.', IP));
+  AssertFalse('"-1.2.3.4"', TryStrToIPv4('-1.2.3.4', IP));
+  AssertFalse('"+1.2.3.4"', TryStrToIPv4('+1.2.3.4', IP));
+end;
+
+procedure TTestIPUtils.TestStrToIPv6_OK;
+var
+  IP: TIPv6Bytes;
+begin
+  AssertTrue('parse "::"', TryStrToIPv6('::', IP));
+  AssertEquals('all zero', 0, Integer(IP[15]));
+
+  AssertTrue('parse "::1"', TryStrToIPv6('::1', IP));
+  AssertEquals('byte 14 zero', 0, Integer(IP[14]));
+  AssertEquals('byte 15 one', 1, Integer(IP[15]));
+
+  AssertTrue('parse "2001:db8::1"', TryStrToIPv6('2001:db8::1', IP));
+  AssertEquals('byte 0', $20, Integer(IP[0]));
+  AssertEquals('byte 1', $01, Integer(IP[1]));
+  AssertEquals('byte 2', $0D, Integer(IP[2]));
+  AssertEquals('byte 3', $B8, Integer(IP[3]));
+  AssertEquals('byte 15', $01, Integer(IP[15]));
+
+  AssertTrue('parse full form', TryStrToIPv6('2001:db8:0:1:2:3:4:5', IP));
+  AssertEquals('byte 8', 0, Integer(IP[8]));
+  AssertEquals('byte 9', $02, Integer(IP[9]));
+  AssertEquals('byte 15', $05, Integer(IP[15]));
+
+  AssertTrue('parse embedded IPv4', TryStrToIPv6('::ffff:192.0.2.1', IP));
+  AssertEquals('byte 10', $FF, Integer(IP[10]));
+  AssertEquals('byte 11', $FF, Integer(IP[11]));
+  AssertEquals('byte 12', $C0, Integer(IP[12]));
+  AssertEquals('byte 15', $01, Integer(IP[15]));
+
+  AssertTrue('parse "fe80::"', TryStrToIPv6('fe80::', IP));
+  AssertEquals('byte 0', $FE, Integer(IP[0]));
+  AssertEquals('byte 1', $80, Integer(IP[1]));
+
+  AssertTrue('parse "1::"', TryStrToIPv6('1::', IP));
+  AssertEquals('byte 1', $01, Integer(IP[1]));
+  AssertEquals('byte 2', 0, Integer(IP[2]));
+end;
+
+procedure TTestIPUtils.TestStrToIPv6_Invalid;
+var
+  IP: TIPv6Bytes;
+begin
+  AssertFalse('empty', TryStrToIPv6('', IP));
+  AssertFalse('IPv4 string', TryStrToIPv6('1.2.3.4', IP));
+  AssertFalse('7 groups', TryStrToIPv6('1:2:3:4:5:6:7', IP));
+  AssertFalse('9 groups', TryStrToIPv6('1:2:3:4:5:6:7:8:9', IP));
+  AssertFalse('two "::"', TryStrToIPv6('1::2::3', IP));
+  AssertFalse('group too long', TryStrToIPv6('12345::', IP));
+  AssertFalse('bad hex', TryStrToIPv6('g::1', IP));
+  AssertFalse('leading single colon', TryStrToIPv6(':1:2:3:4:5:6:7', IP));
+  AssertFalse('trailing single colon', TryStrToIPv6('1:2:3:4:5:6:7:', IP));
+  AssertFalse('zone id', TryStrToIPv6('fe80::1%eth0', IP));
+  AssertFalse('8 groups plus "::"', TryStrToIPv6('1:2:3:4:5:6:7:8::', IP));
+end;
+
+procedure TTestIPUtils.TestIPv4InNetwork;
+begin
+  AssertTrue('8.8.8.8 in 8.0.0.0/8',
+    IPv4InNetwork($08080808, $08000000, 8));
+  AssertFalse('9.0.0.1 in 8.0.0.0/8',
+    IPv4InNetwork($09000001, $08000000, 8));
+  AssertTrue('192.0.2.130 in 192.0.2.0/24',
+    IPv4InNetwork($C0000282, $C0000200, 24));
+  AssertFalse('192.0.3.1 in 192.0.2.0/24',
+    IPv4InNetwork($C0000301, $C0000200, 24));
+  AssertTrue('203.0.113.200 in 203.0.113.128/25',
+    IPv4InNetwork($CB0071C8, $CB007180, 25));
+  AssertFalse('203.0.113.5 in 203.0.113.128/25',
+    IPv4InNetwork($CB007105, $CB007180, 25));
+end;
+
+procedure TTestIPUtils.TestIPv4InNetwork_EdgePrefixes;
+begin
+  AssertTrue('/0 matches anything', IPv4InNetwork($01020304, 0, 0));
+  AssertTrue('/32 exact match', IPv4InNetwork($08080808, $08080808, 32));
+  AssertFalse('/32 different', IPv4InNetwork($08080809, $08080808, 32));
+  AssertFalse('negative prefix', IPv4InNetwork($08080808, $08000000, -1));
+  AssertFalse('prefix > 32', IPv4InNetwork($08080808, $08000000, 33));
+end;
+
+procedure TTestIPUtils.TestIPv6InNetwork;
+var
+  IP, Net: TIPv6Bytes;
+begin
+  AssertTrue('parse IP', TryStrToIPv6('2001:db8::1', IP));
+
+  AssertTrue('parse net', TryStrToIPv6('2001:db8::', Net));
+  AssertTrue('2001:db8::1 in 2001:db8::/32', IPv6InNetwork(IP, Net, 32));
+
+  AssertTrue('parse net 2', TryStrToIPv6('2001:db9::', Net));
+  AssertFalse('2001:db8::1 in 2001:db9::/32', IPv6InNetwork(IP, Net, 32));
+
+  AssertTrue('parse net 3', TryStrToIPv6('2620:0:2d0::', Net));
+  AssertTrue('/48 match', IPv6InNetwork(IP, Net, 48) = False);
+
+  AssertTrue('parse net 4', TryStrToIPv6('2a00::', Net));
+  AssertTrue('parse IP 2', TryStrToIPv6('2a01:4f8::1', IP));
+  AssertTrue('2a01:: in 2a00::/12', IPv6InNetwork(IP, Net, 12));
+
+  AssertTrue('/0 matches all', IPv6InNetwork(IP, Net, 0));
+  AssertFalse('prefix > 128', IPv6InNetwork(IP, Net, 129));
+end;
+
+procedure TTestIPUtils.TestDomainMatchesKey;
+begin
+  AssertEquals('single label', 1, DomainMatchesKey('example.com', 'com'));
+  AssertEquals('multi-label key', 2, DomainMatchesKey('a.b.example.co.uk', 'co.uk'));
+  AssertEquals('exact match', 2, DomainMatchesKey('co.uk', 'co.uk'));
+  AssertEquals('no match', 0, DomainMatchesKey('example.com', 'net'));
+  AssertEquals('partial label does not match', 0, DomainMatchesKey('example.com', 'ample.com'));
+  AssertEquals('longer domain than key', 1, DomainMatchesKey('example.com', 'com'));
+end;
+
+procedure TTestIPUtils.TestEncodePathSegment;
+begin
+  AssertEquals('plain kept', 'example.com', EncodePathSegment('example.com'));
+  AssertEquals('space encoded', 'a%20b', EncodePathSegment('a b'));
+  AssertEquals('slash encoded', 'a%2Fb', EncodePathSegment('a/b'));
+  AssertEquals('unreserved kept', 'ABC-123_~.x', EncodePathSegment('ABC-123_~.x'));
+  AssertEquals('empty', '', EncodePathSegment(''));
+end;
+
+{ TTestBootstrap }
+
+procedure TTestBootstrap.SetUp;
+begin
+  inherited SetUp;
+  FBootstrap := TRDAPBootstrap.Create;
+end;
+
+procedure TTestBootstrap.TearDown;
+begin
+  FBootstrap.Free;
+  inherited TearDown;
+end;
+
+procedure TTestBootstrap.LoadAll;
+begin
+  FBootstrap.LoadFromLocalFiles(MakeFile(BootstrapDNS), MakeFile(BootstrapIPv4),
+    MakeFile(BootstrapIPv6));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForDomain;
+begin
+  LoadAll;
+  AssertEquals('com', 'https://rdap.verisign.com/com/v1/',
+    FBootstrap.GetBaseURLForDomain('example.com'));
+  AssertEquals('net', 'https://rdap.verisign.com/com/v1/',
+    FBootstrap.GetBaseURLForDomain('example.net'));
+  AssertEquals('org', 'https://rdap.pir.org/',
+    FBootstrap.GetBaseURLForDomain('example.org'));
+  AssertEquals('ru', 'https://rdap.tcinet.ru/',
+    FBootstrap.GetBaseURLForDomain('example.ru'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForDomain_MultiLabelTLD;
+begin
+  LoadAll;
+  AssertEquals('co.uk', 'https://rdap.nominet.uk/',
+    FBootstrap.GetBaseURLForDomain('example.co.uk'));
+  AssertEquals('org.uk', 'https://rdap.nominet.uk/',
+    FBootstrap.GetBaseURLForDomain('foo.org.uk'));
+  AssertEquals('deeper domain', 'https://rdap.nominet.uk/',
+    FBootstrap.GetBaseURLForDomain('a.b.example.co.uk'));
+  AssertEquals('plain uk still works', 'https://rdap.ukregistry.example/',
+    FBootstrap.GetBaseURLForDomain('example.uk'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForDomain_CaseInsensitive;
+begin
+  LoadAll;
+  AssertEquals('COM', 'https://rdap.verisign.com/com/v1/',
+    FBootstrap.GetBaseURLForDomain('Example.COM'));
+  AssertEquals('CO.UK', 'https://rdap.nominet.uk/',
+    FBootstrap.GetBaseURLForDomain('EXAMPLE.Co.UK'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForDomain_NotFound;
+var
+  Raised: Boolean;
+begin
+  LoadAll;
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForDomain('example.xyz');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions the domain', Pos('example.xyz', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForDomain_Reload;
+begin
+  FBootstrap.LoadDNS(MakeFile(BootstrapDNS));
+  FBootstrap.LoadDNS(MakeFile(BootstrapDNS));
+  AssertEquals('works after reload', 'https://rdap.pir.org/',
+    FBootstrap.GetBaseURLForDomain('example.org'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForIP_IPv4;
+begin
+  LoadAll;
+  AssertEquals('192.0.2.55', 'https://rdap.test.example/',
+    FBootstrap.GetBaseURLForIP('192.0.2.55'));
+  AssertEquals('198.51.100.7', 'https://rdap.test.example/',
+    FBootstrap.GetBaseURLForIP('198.51.100.7'));
+  AssertEquals('203.0.113.77', 'https://rdap.test2.example/',
+    FBootstrap.GetBaseURLForIP('203.0.113.77'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForIP_IPv4_LongestPrefixWins;
+begin
+  LoadAll;
+  // matches both 8.0.0.0/8 (arin) and 8.8.8.0/24 (lucky): /24 must win
+  AssertEquals('longest prefix', 'https://rdap.lucky.example/',
+    FBootstrap.GetBaseURLForIP('8.8.8.8'));
+  // only /8 matches
+  AssertEquals('single match', 'https://rdap.arin.net/registry/',
+    FBootstrap.GetBaseURLForIP('8.8.4.4'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForIP_IPv6;
+begin
+  LoadAll;
+  AssertEquals('2001:db8::1', 'https://rdap.db8.example/',
+    FBootstrap.GetBaseURLForIP('2001:db8::1'));
+  AssertEquals('2a01:4f8::1', 'https://rdap.ripe.example/',
+    FBootstrap.GetBaseURLForIP('2a01:4f8::1'));
+  AssertEquals('2620:0:2d0:200::1', 'https://rdap.v6nic.example/',
+    FBootstrap.GetBaseURLForIP('2620:0:2d0:200::1'));
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForIP_Invalid;
+var
+  Raised: Boolean;
+begin
+  LoadAll;
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('999.1.1.1');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions "Invalid IP"', Pos('Invalid IP', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestBootstrap.TestGetBaseURLForIP_NotFound;
+var
+  Raised: Boolean;
+begin
+  LoadAll;
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('9.9.9.9');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions "No RDAP server"', Pos('No RDAP server', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('::1');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('IPv6 not covered either', Raised);
+end;
+
+procedure TTestBootstrap.TestNotLoaded;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('DNS message', Pos('DNS bootstrap not loaded', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('8.8.8.8');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('IPv4 message', Pos('IPv4 bootstrap not loaded', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('::1');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('IPv6 message', Pos('IPv6 bootstrap not loaded', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestBootstrap.TestLoadFromLocalFiles_SkipsEmptyNames;
+var
+  Raised: Boolean;
+begin
+  FBootstrap.LoadFromLocalFiles(MakeFile(BootstrapDNS), '', '');
+  AssertEquals('DNS still works', 'https://rdap.pir.org/',
+    FBootstrap.GetBaseURLForDomain('example.org'));
+
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForIP('8.8.8.8');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('IPv4 skipped', Raised);
+end;
+
+procedure TTestBootstrap.TestLoadFromLocalFiles_MissingFile;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    FBootstrap.LoadDNS('no-such-file.json');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions "not found"', Pos('not found', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestBootstrap.TestLoad_InvalidJSON;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    FBootstrap.LoadDNS(MakeFile('this is not json'));
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions JSON parse', Pos('JSON parse', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+{ TTestRDAPClient }
+
 procedure TTestRDAPClient.SetUp;
 begin
+  inherited SetUp;
   FClient := TRDAPClientMock.Create;
   FMockJSON := '{"objectClassName":"domain","handle":"example.com","ldhName":"example.com"}';
   FMockJSONIP := '{"objectClassName":"ip network","handle":"8.8.8.8/32"}';
@@ -42,60 +615,369 @@ end;
 procedure TTestRDAPClient.TearDown;
 begin
   FClient.Free;
+  inherited TearDown;
+end;
+
+function TTestRDAPClient.NewDNSBootstrap: TRDAPBootstrap;
+begin
+  Result := TRDAPBootstrap.Create;
+  Result.LoadDNS(MakeFile(BootstrapDNS));
 end;
 
 procedure TTestRDAPClient.TestConstructor;
 begin
-  AssertNotNull('Client created', FClient);
-  AssertEquals('Default base URL', 'https://rdap.org/', FClient.BaseURL);
+  AssertEquals('default base URL is empty', '', FClient.BaseURL);
+  AssertEquals('default user agent', 'fp-rdap-client/1.0', FClient.UserAgent);
+  AssertTrue('initial status', FClient.LastStatus = rqsNone);
+  AssertEquals('no requests yet', 0, FClient.MockRequestCount);
 end;
 
-procedure TTestRDAPClient.TestQueryDomain;
+procedure TTestRDAPClient.TestQueryDomain_Mock;
 begin
-  FClient.MockDoHTTPGetJSON(FMockJSON);
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  AssertEquals('raw JSON returned', FMockJSON, FClient.QueryDomain('example.com'));
+  AssertEquals('request URL', 'https://rdap.example.org/domain/example.com',
+    FClient.LastURL);
+  AssertTrue('status OK', FClient.LastStatus = rqsOK);
+  AssertEquals('title', 'example.com', FClient.GetObjectTitle);
+end;
+
+procedure TTestRDAPClient.TestQueryDomain_BaseURLNormalized;
+begin
+  FClient.BaseURL := 'https://rdap.example.org/';
+  FClient.SetupMock(FMockJSON);
   FClient.QueryDomain('example.com');
-  AssertEquals('Mock JSON returned', FMockJSON, FClient.LastRawJSON);
-  AssertEquals('Title from mock', 'example.com', FClient.GetObjectTitle);
+  AssertEquals('no double slash', 'https://rdap.example.org/domain/example.com',
+    FClient.LastURL);
 end;
 
-procedure TTestRDAPClient.TestQueryIP;
+procedure TTestRDAPClient.TestQueryDomain_BaseURLOverridesBootstrap;
+var
+  B: TRDAPBootstrap;
 begin
-  FClient.MockDoHTTPGetJSON(FMockJSONIP);
-  FClient.QueryIP('8.8.8.8');
-  AssertEquals('IP mock JSON', FMockJSONIP, FClient.LastRawJSON);
-  AssertEquals('IP object type', 'ip network', FClient.GetObjectType);
+  B := NewDNSBootstrap;
+  try
+    FClient.Bootstrap := B;
+    FClient.BaseURL := 'https://rdap.example.org';
+    FClient.SetupMock(FMockJSON);
+    FClient.QueryDomain('example.com');
+    AssertEquals('base URL wins over bootstrap',
+      'https://rdap.example.org/domain/example.com', FClient.LastURL);
+  finally
+    B.Free;
+  end;
 end;
 
-procedure TTestRDAPClient.TestGetObjectTitle;
-begin              
-  FClient.MockDoHTTPGetJSON(FMockJSON);
-  FClient.QueryDomain('example.com'); // Fill LastJSON mock-data
-  AssertEquals('Object title from handle/ldhName', 'example.com', FClient.GetObjectTitle);
+procedure TTestRDAPClient.TestQueryDomain_UsesBootstrapBaseURL;
+var
+  B: TRDAPBootstrap;
+begin
+  B := NewDNSBootstrap;
+  try
+    FClient.Bootstrap := B;
+    FClient.SetupMock(FMockJSON);
+    FClient.QueryDomain('example.com');
+    AssertEquals('bootstrap URL is actually used',
+      'https://rdap.verisign.com/com/v1/domain/example.com', FClient.LastURL);
+  finally
+    B.Free;
+  end;
+end;
+
+procedure TTestRDAPClient.TestQueryDomain_NoBaseNoBootstrap;
+var
+  Raised: Boolean;
+begin
+  FClient.SetupMock(FMockJSON);
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message', Pos('No base URL', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('no request performed', 0, FClient.MockRequestCount);
+end;
+
+procedure TTestRDAPClient.TestQueryDomain_EmptyDomain;
+var
+  Raised: Boolean;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  Raised := False;
+  try
+    FClient.QueryDomain('   ');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message', Pos('Domain is empty', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('no request performed', 0, FClient.MockRequestCount);
+end;
+
+procedure TTestRDAPClient.TestQueryDomain_EncodesPath;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  FClient.QueryDomain('two words.example');
+  AssertTrue('space percent-encoded in ' + FClient.LastURL,
+    Pos('two%20words.example', FClient.LastURL) > 0);
+end;
+
+procedure TTestRDAPClient.TestQueryIP_Mock;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSONIP);
+  AssertEquals('raw JSON returned', FMockJSONIP, FClient.QueryIP('8.8.8.8'));
+  AssertEquals('request URL', 'https://rdap.example.org/ip/8.8.8.8', FClient.LastURL);
+  AssertEquals('object type', 'ip network', FClient.GetObjectType);
+end;
+
+procedure TTestRDAPClient.TestQueryIP_IPv6;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{}');
+  FClient.QueryIP('2001:db8::1');
+  AssertEquals('request URL', 'https://rdap.example.org/ip/2001:db8::1', FClient.LastURL);
+end;
+
+procedure TTestRDAPClient.TestQueryIP_InvalidIP;
+var
+  Raised: Boolean;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSONIP);
+  Raised := False;
+  try
+    FClient.QueryIP('999.1.2.3');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message', Pos('Invalid IP', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('no request performed', 0, FClient.MockRequestCount);
+end;
+
+procedure TTestRDAPClient.TestQueryIP_UsesBootstrapBaseURL;
+var
+  B: TRDAPBootstrap;
+begin
+  B := TRDAPBootstrap.Create;
+  try
+    B.LoadIPv4(MakeFile(BootstrapIPv4));
+    B.LoadIPv6(MakeFile(BootstrapIPv6));
+    FClient.Bootstrap := B;
+    FClient.SetupMock('{}');
+    FClient.QueryIP('8.8.8.8');
+    AssertEquals('IPv4 bootstrap URL used',
+      'https://rdap.lucky.example/ip/8.8.8.8', FClient.LastURL);
+    FClient.QueryIP('2001:db8::1');
+    AssertEquals('IPv6 bootstrap URL used',
+      'https://rdap.db8.example/ip/2001:db8::1', FClient.LastURL);
+  finally
+    B.Free;
+  end;
+end;
+
+procedure TTestRDAPClient.TestQueryAutNum;
+begin
+  FClient.BaseURL := 'https://rdap.db.ripe.net';
+  FClient.SetupMock('{"objectClassName":"autnum"}');
+  FClient.QueryAutNum('AS3356');
+  AssertEquals('request URL', 'https://rdap.db.ripe.net/autnum/AS3356', FClient.LastURL);
+end;
+
+procedure TTestRDAPClient.TestQueryAutNum_NoBaseURL;
+var
+  Raised: Boolean;
+begin
+  FClient.SetupMock('{}');
+  Raised := False;
+  try
+    FClient.QueryAutNum('AS3356');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message', Pos('Base URL not set', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestRDAPClient.TestQueryEntity;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"objectClassName":"entity","handle":"ABC-123"}');
+  FClient.QueryEntity('ABC-123');
+  AssertEquals('request URL', 'https://rdap.example.org/entity/ABC-123', FClient.LastURL);
+end;
+
+procedure TTestRDAPClient.TestQueryEntity_EncodesPath;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{}');
+  FClient.QueryEntity('JOHN DOE');
+  AssertTrue('space percent-encoded in ' + FClient.LastURL,
+    Pos('JOHN%20DOE', FClient.LastURL) > 0);
+end;
+
+procedure TTestRDAPClient.TestGetObjectTitle_PrefersHandle;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  FClient.QueryDomain('example.com');
+  AssertEquals('handle wins over ldhName', 'example.com', FClient.GetObjectTitle);
+end;
+
+procedure TTestRDAPClient.TestGetObjectTitle_FallsBackToName;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"objectClassName":"entity","name":"Some Body"}');
+  FClient.QueryEntity('XYZ');
+  AssertEquals('name fallback', 'Some Body', FClient.GetObjectTitle);
 end;
 
 procedure TTestRDAPClient.TestGetObjectType;
 begin
-  FClient.MockDoHTTPGetJSON(FMockJSON);
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
   FClient.QueryDomain('example.com');
-  AssertEquals('Object type', 'domain', FClient.GetObjectType);
+  AssertEquals('object type', 'domain', FClient.GetObjectType);
 end;
 
 procedure TTestRDAPClient.TestLastStatusNotFound;
 begin
-  FClient.MockDoHTTPGetJSON('', 404);
-  FClient.QueryDomain('missing');
-  AssertFalse('IsFound=False', FClient.LastStatus = rqsOK);
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('', 404);
+  FClient.QueryDomain('missing.com');
+  AssertTrue('status is rqsNotFound', FClient.LastStatus = rqsNotFound);
+  AssertEquals('empty title', '', FClient.GetObjectTitle);
+  AssertEquals('empty type', '', FClient.GetObjectType);
 end;
 
-procedure TTestRDAPClient.TestGetTitleNotFound;
+procedure TTestRDAPClient.TestNotFound_KeepsErrorBody;
 begin
-  FClient.MockDoHTTPGetJSON('', 404);
-  FClient.QueryDomain('404.com');
-  AssertEquals('Empty title', '', FClient.GetObjectTitle);
-  AssertEquals('Empty type', '', FClient.GetObjectType);
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"errorCode":404,"title":"Object not found"}', 404);
+  FClient.QueryDomain('missing.com');
+  AssertTrue('status is rqsNotFound', FClient.LastStatus = rqsNotFound);
+  AssertTrue('body kept', Pos('Object not found', FClient.LastRawJSON) > 0);
+  AssertEquals('errorCode extracted', 404, FClient.LastErrorCode);
+  AssertEquals('title extracted', 'Object not found', FClient.LastErrorTitle);
+end;
+
+procedure TTestRDAPClient.TestRateLimited;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"errorCode":429,"title":"Too many requests"}', 429);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
+  AssertEquals('errorCode extracted', 429, FClient.LastErrorCode);
+  AssertEquals('title extracted', 'Too many requests', FClient.LastErrorTitle);
+end;
+
+procedure TTestRDAPClient.TestUnexpectedStatus_Raises;
+var
+  Raised: Boolean;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('oops', 500);
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions status', Pos('500', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+end;
+
+procedure TTestRDAPClient.TestNetworkError_Wrapped;
+var
+  Raised: Boolean;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMockError('connection refused');
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message kept', Pos('connection refused', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+end;
+
+procedure TTestRDAPClient.TestMalformed200JSON;
+var
+  Raised: Boolean;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('this is not json', 200);
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions JSON parse', Pos('JSON parse', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+end;
+
+procedure TTestRDAPClient.TestMockRecordsRequests;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  FClient.QueryDomain('a.com');
+  FClient.QueryDomain('b.com');
+  AssertEquals('two requests recorded', 2, FClient.MockRequestCount);
+  AssertEquals('first URL', 'https://rdap.example.org/domain/a.com',
+    FClient.MockRequestURL(0));
+  AssertEquals('second URL', 'https://rdap.example.org/domain/b.com',
+    FClient.MockRequestURL(1));
 end;
 
 initialization
+  RegisterTest(TTestIPUtils);
+  RegisterTest(TTestBootstrap);
   RegisterTest(TTestRDAPClient);
 
 end.
