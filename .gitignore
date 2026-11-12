@@ -35,5 +35,8 @@ lib/
 # Application bundle for Mac OS
 *.app/
 
-Some additional markup files
+# Some additional markup files (bootstrap snapshots are not committed)
 *.json
+
+# ZCode agent workspace (roadmap etc., local only)
+.zcode/
