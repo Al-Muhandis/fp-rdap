@@ -74,6 +74,7 @@ type
     procedure TestIPv6InNetwork;
     procedure TestDomainMatchesKey;
     procedure TestEncodePathSegment;
+    procedure TestParseRetryAfter;
   end;
 
   { TTestBootstrap - bootstrap file loading and server lookup }
@@ -137,6 +138,9 @@ type
     procedure TestLastStatusNotFound;
     procedure TestNotFound_KeepsErrorBody;
     procedure TestRateLimited;
+    procedure TestRetryAfter_Seconds;
+    procedure TestRetryAfter_HTTPDate;
+    procedure TestRetryAfter_AbsentAndNotCarriedOver;
     procedure TestErrorTitle_UTF8;
     procedure TestUnexpectedStatus_Raises;
     procedure TestNetworkError_Wrapped;
@@ -336,6 +340,35 @@ begin
   AssertEquals('slash encoded', 'a%2Fb', EncodePathSegment('a/b'));
   AssertEquals('unreserved kept', 'ABC-123_~.x', EncodePathSegment('ABC-123_~.x'));
   AssertEquals('empty', '', EncodePathSegment(''));
+end;
+
+procedure TTestIPUtils.TestParseRetryAfter;
+var
+  S: Integer;
+begin
+  // Delay-seconds form
+  AssertTrue('seconds', TryParseRetryAfter('120', S));
+  AssertEquals('seconds value', 120, S);
+  AssertTrue('padded seconds', TryParseRetryAfter(' 7 ', S));
+  AssertEquals('padded seconds value', 7, S);
+  AssertTrue('zero seconds', TryParseRetryAfter('0', S));
+  AssertEquals('zero seconds value', 0, S);
+  // Absent or unparseable: False and 0
+  AssertFalse('empty', TryParseRetryAfter('', S));
+  AssertEquals('empty value', 0, S);
+  AssertFalse('whitespace only', TryParseRetryAfter('  ', S));
+  AssertFalse('garbage', TryParseRetryAfter('soon', S));
+  AssertFalse('negative seconds', TryParseRetryAfter('-5', S));
+  AssertFalse('fractional seconds', TryParseRetryAfter('1.5', S));
+  AssertFalse('overflow seconds', TryParseRetryAfter('99999999999999999999', S));
+  // HTTP-date form: past date yields 0, future date yields positive seconds
+  AssertTrue('past date', TryParseRetryAfter('Sat, 01 Jan 2000 00:00:00 GMT', S));
+  AssertEquals('past date value', 0, S);
+  AssertTrue('future date', TryParseRetryAfter('Sat, 01 Jan 2050 00:00:00 GMT', S));
+  AssertTrue('future date value in range', (S > 0) and (S <= MaxInt));
+  AssertFalse('date without GMT', TryParseRetryAfter('Sat, 01 Jan 2050 00:00:00 UTC', S));
+  AssertFalse('obsolete RFC 850 date', TryParseRetryAfter('Sunday, 06-Nov-94 08:49:37 GMT', S));
+  AssertFalse('bad month', TryParseRetryAfter('Sun, 06 Foo 1994 08:49:37 GMT', S));
 end;
 
 { TTestBootstrap }
@@ -625,6 +658,23 @@ begin
 end;
 
 { TTestRDAPClient }
+
+const
+  // English short names exactly as an HTTP server sends them (RFC 7231 §7.1.1.1).
+  HTTPDayNames: array[1..7] of string = ('Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat');
+  HTTPMonthNames: array[1..12] of string = ('Jan', 'Feb', 'Mar', 'Apr', 'May',
+    'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+
+// Formats D as an IMF-fixdate HTTP-date, e.g. 'Sun, 06 Nov 1994 08:49:37 GMT'.
+function FormatHTTPDate(D: TDateTime): string;
+var
+  Y, M, Day, H, Min, S, MS: Word;
+begin
+  DecodeDate(D, Y, M, Day);
+  DecodeTime(D, H, Min, S, MS);
+  Result := Format('%s, %.2d %s %.4d %.2d:%.2d:%.2d GMT',
+    [HTTPDayNames[DayOfWeek(D)], Day, HTTPMonthNames[M], Y, H, Min, S]);
+end;
 
 procedure TTestRDAPClient.SetUp;
 begin
@@ -917,6 +967,68 @@ begin
   AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
   AssertEquals('errorCode extracted', 429, FClient.LastErrorCode);
   AssertEquals('title extracted', 'Too many requests', FClient.LastErrorTitle);
+end;
+
+// 429 with Retry-After in the delay-seconds form (RFC 7231 §7.1.3).
+procedure TTestRDAPClient.TestRetryAfter_Seconds;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"errorCode":429,"title":"Too many requests"}', 429,
+    ['Retry-After: 120']);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
+  AssertEquals('seconds form', 120, FClient.RetryAfter);
+
+  // Header names are case-insensitive (RFC 7230 §3.2).
+  FClient.SetupMock('{"errorCode":429}', 429, ['retry-after: 30']);
+  FClient.QueryDomain('example.com');
+  AssertEquals('case-insensitive lookup', 30, FClient.RetryAfter);
+end;
+
+// 429 with Retry-After as an HTTP-date: whole seconds until the date,
+// 0 when the date is already in the past.
+procedure TTestRDAPClient.TestRetryAfter_HTTPDate;
+var
+  Target: TDateTime;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  // A date roughly an hour ahead: the exact value depends on "now", so only
+  // the 1-hour ballpark is asserted.
+  Target := Now + 3600 / SecsPerDay;
+  FClient.SetupMock('{"errorCode":429}', 429,
+    ['Retry-After: ' + FormatHTTPDate(Target)]);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
+  AssertTrue('seconds until the future date',
+    (FClient.RetryAfter > 3540) and (FClient.RetryAfter <= 3600));
+
+  // A past date means "no wait": 0.
+  FClient.SetupMock('{"errorCode":429}', 429,
+    ['Retry-After: Sat, 01 Jan 2000 00:00:00 GMT']);
+  FClient.QueryDomain('example.com');
+  AssertEquals('past date yields 0', 0, FClient.RetryAfter);
+end;
+
+// Without the header RetryAfter stays 0, and the value of an earlier response
+// does not leak into a later one without the header.
+procedure TTestRDAPClient.TestRetryAfter_AbsentAndNotCarriedOver;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  // First-ever request, no header at all.
+  FClient.SetupMock('{"errorCode":429,"title":"Too many requests"}', 429);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
+  AssertEquals('absent header yields 0', 0, FClient.RetryAfter);
+
+  // Then a response carrying the header...
+  FClient.SetupMock('{"errorCode":429}', 429, ['Retry-After: 120']);
+  FClient.QueryDomain('example.com');
+  AssertEquals('seconds form', 120, FClient.RetryAfter);
+
+  // ...and the next one without it: the value must not leak between requests.
+  FClient.SetupMock('{"errorCode":429}', 429);
+  FClient.QueryDomain('example.com');
+  AssertEquals('not carried over', 0, FClient.RetryAfter);
 end;
 
 // RDAP payloads are UTF-8 (RFC 9083): a "title" that mixes JSON \uXXXX escapes

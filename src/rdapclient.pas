@@ -28,6 +28,11 @@ function IPv6InNetwork(const aIP, aNetworkIP: TIPv6Bytes; aPrefixLen: Integer): 
 function DomainMatchesKey(const aDomain, aKey: string): Integer;
 { Percent-encodes a string so it is safe to embed as a single URL path segment. }
 function EncodePathSegment(const S: string): string;
+{ Parses a Retry-After header value (RFC 7231 §7.1.3): either a delay in seconds
+  or an IMF-fixdate HTTP-date ("Sun, 06 Nov 1994 08:49:37 GMT"). ASeconds is the
+  delay in whole seconds; a date in the past yields 0. False (and ASeconds = 0)
+  for an empty or unparseable value. }
+function TryParseRetryAfter(const AValue: string; out ASeconds: Integer): Boolean;
 
 type
   { TRDAPBootstrap }
@@ -98,6 +103,12 @@ type
     function ExecuteQuery(const APath, ABase: string): string;
     function RequireBaseURL: string;
   protected
+    // Snapshot of the last response's headers ("Name: value" wire lines);
+    // filled by DoHTTPGetJSON (real client and mock alike), cleared in
+    // ClearLastState.
+    FResponseHeaders: TStringList;
+    // Case-insensitive lookup of a header of the last response, '' if absent.
+    function GetResponseHeader(const AName: string): string; virtual;
     // Performs the actual HTTP GET and returns the response body.
     // Override to mock the network layer in tests.
     function DoHTTPGetJSON(const AURL, AUserAgent: string): string; virtual;
@@ -118,7 +129,8 @@ type
     // errorCode/title from an RFC 9083 error object in the last response, if any.
     property LastErrorCode: Integer read FLastErrorCode;
     property LastErrorTitle: string read FLastErrorTitle;
-    // Retry-After header (seconds) of a 429 response, 0 if absent.
+    // Retry-After header (in seconds) of the last response, 0 if absent.
+    // Both RFC 7231 forms are accepted: delay-seconds and HTTP-date.
     property RetryAfter: Integer read FRetryAfter;
 
     // The bootstrap is not owned by the client: create and free it yourself.
@@ -133,8 +145,8 @@ type
     function GetObjectType: string;
   end;
 
-  { TRDAPClientMock - records request URLs and replays a canned response,
-    so unit tests never touch the network. }
+  { TRDAPClientMock - records request URLs and replays a canned response
+    (optionally with response headers), so unit tests never touch the network. }
 
   TRDAPClientMock = class(TRDAPClient)
   private
@@ -143,6 +155,7 @@ type
     FMockError: string;
     FMockEnabled: Boolean;
     FMockRequests: TStringList;
+    FMockHeaders: TStringList; // headers replayed with the canned response
     function GetMockRequestCount: Integer;
   protected
     function DoHTTPGetJSON(const AURL, AUserAgent: string): string; override;
@@ -150,7 +163,11 @@ type
     constructor Create(const ABaseURL: string = ''); override;
     destructor Destroy; override;
 
-    procedure SetupMock(const AMockResponse: string; AHTTPCode: Integer = 200);
+    procedure SetupMock(const AMockResponse: string; AHTTPCode: Integer = 200); overload;
+    { Same as SetupMock, but the response also carries the given raw header
+      lines ("Name: value"), e.g. ['Retry-After: 120']. }
+    procedure SetupMock(const AMockResponse: string; AHTTPCode: Integer;
+      const AHeaders: array of string); overload;
     // Makes the next requests raise ERDAPError with the given message,
     // as if the network layer had failed.
     procedure SetupMockError(const AError: string);
@@ -250,6 +267,112 @@ begin
   for I := 1 to Length(S) do
     if not (S[I] in ['0'..'9']) then
       Exit(False);
+end;
+
+// Parses an IMF-fixdate HTTP-date (RFC 7231 §7.1.1.1), e.g.
+// 'Sun, 06 Nov 1994 08:49:37 GMT'. The two obsolete formats (RFC 850, asctime)
+// are not supported. The day name is skipped unvalidated. The result is a plain
+// wall-clock value: comparing it against Now yields the correct UTC delta in
+// any time zone, so no timezone conversion is needed here.
+function TryParseHTTPFixdate(const S: string; out ADate: TDateTime): Boolean;
+var
+  Tokens, TimeParts: TStringList;
+  CommaPos, I: Integer;
+  Day, Month, Year, Hour, Minute, Second: Integer;
+  TimeOfDay: TDateTime;
+
+  function MonthIndex(const AMonth: string): Integer;
+  const
+    Months: array[1..12] of string = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+  var
+    I: Integer;
+  begin
+    Result := 0;
+    for I := Low(Months) to High(Months) do
+      if CompareText(AMonth, Months[I]) = 0 then
+        Exit(I);
+  end;
+
+begin
+  Result := False;
+  ADate := 0;
+  CommaPos := Pos(',', S);
+  if CommaPos = 0 then
+    Exit;
+  Tokens := TStringList.Create;
+  TimeParts := TStringList.Create;
+  try
+    // Drop the day name: the remainder is "06 Nov 1994 08:49:37 GMT".
+    SplitByChar(Trim(Copy(S, CommaPos + 1, MaxInt)), ' ', Tokens);
+    for I := Tokens.Count - 1 downto 0 do
+      if Tokens[I] = '' then
+        Tokens.Delete(I); // tolerate doubled spaces
+    if (Tokens.Count <> 5) or (CompareText(Tokens[4], 'GMT') <> 0) then
+      Exit;
+    if not AllDigits(Tokens[0]) or not AllDigits(Tokens[2]) or
+       (Length(Tokens[2]) <> 4) then
+      Exit; // day, 4-digit year
+    SplitByChar(Tokens[3], ':', TimeParts);
+    if (TimeParts.Count <> 3) or not AllDigits(TimeParts[0]) or
+       not AllDigits(TimeParts[1]) or not AllDigits(TimeParts[2]) then
+      Exit;
+    Day := StrToIntDef(Tokens[0], 0);
+    Month := MonthIndex(Tokens[1]);
+    Year := StrToIntDef(Tokens[2], 0);
+    Hour := StrToIntDef(TimeParts[0], 0);
+    Minute := StrToIntDef(TimeParts[1], 0);
+    Second := StrToIntDef(TimeParts[2], 0);
+    // Keep the Word parameters of TryEncodeDate/TryEncodeTime in range even
+    // with range checking on; they validate the remaining semantics.
+    if (Day < 1) or (Day > 31) or (Month = 0) or (Year < 1) or (Year > 9999) or
+       (Hour > 23) or (Minute > 59) or (Second > 59) then
+      Exit;
+    if not TryEncodeDate(Year, Month, Day, ADate) or
+       not TryEncodeTime(Hour, Minute, Second, 0, TimeOfDay) then
+      Exit;
+    ADate := ADate + TimeOfDay;
+    Result := True;
+  finally
+    Tokens.Free;
+    TimeParts.Free;
+  end;
+end;
+
+function TryParseRetryAfter(const AValue: string; out ASeconds: Integer): Boolean;
+var
+  S: string;
+  N: Integer;
+  DT: TDateTime;
+  Secs: Int64;
+begin
+  ASeconds := 0;
+  S := Trim(AValue);
+  if S = '' then
+    Exit(False);
+  // Delay-seconds form (1*DIGIT); overflow or a negative is not a valid delay.
+  if AllDigits(S) then
+  begin
+    if TryStrToInt(S, N) then
+    begin
+      ASeconds := N;
+      Exit(True);
+    end;
+    Exit(False);
+  end;
+  // HTTP-date form: whole seconds until the date, 0 when already in the past.
+  // Values beyond MaxInt are clamped - Retry-After is advisory anyway.
+  if TryParseHTTPFixdate(S, DT) then
+  begin
+    Secs := Trunc((DT - Now) * SecsPerDay);
+    if Secs < 0 then
+      Secs := 0
+    else if Secs > High(Integer) then
+      Secs := High(Integer);
+    ASeconds := Integer(Secs);
+    Exit(True);
+  end;
+  Result := False;
 end;
 
 function TryStrToIPv4(const S: string; out aIP: Cardinal): Boolean;
@@ -770,6 +893,7 @@ begin
   FLastErrorCode := 0;
   FLastErrorTitle := '';
   FRetryAfter := 0;
+  FResponseHeaders.Clear;
 end;
 
 procedure TRDAPClient.InitSSLIfNeeded(const AURL: string);
@@ -781,6 +905,16 @@ begin
   if not InitSSLInterface then
     raise ERDAPError.Create('SSL init failed: OpenSSL libraries not found');
   FSSLInitialized := True;
+end;
+
+// Case-insensitive lookup of a header of the last response, '' if absent.
+// Both header sources keep raw "Name: value" wire lines with ':' as the
+// name/value separator (TFPHttpClient.ResponseHeaders, and the mock copies
+// that via Assign), so TStrings.Values applies. The Trim is correct by
+// definition: an HTTP field value excludes surrounding whitespace (RFC 7230 §3.2).
+function TRDAPClient.GetResponseHeader(const AName: string): string;
+begin
+  Result := Trim(FResponseHeaders.Values[AName]);
 end;
 
 procedure TRDAPClient.ProcessLastResponse;
@@ -812,6 +946,10 @@ begin
         [FLastHTTPCode, FLastURL]);
     end;
   end;
+  // Retry-After (RFC 7231) is parsed here rather than in DoHTTPGetJSON, so
+  // mock and real responses share one code path; 0 when the header is
+  // absent or unparseable.
+  TryParseRetryAfter(GetResponseHeader('Retry-After'), FRetryAfter);
   ExtractRDAPError;
 end;
 
@@ -858,7 +996,10 @@ begin
     try
       C.HTTPMethod('GET', AURL, SS, [200, 404, 429]);
       Result := SS.DataString;
-      FRetryAfter := StrToIntDef(C.ResponseHeaders.Values['Retry-After'], 0);
+      // Snapshot the response headers; Assign also carries over the ':'
+      // name/value separator that GetResponseHeader relies on. Retry-After
+      // itself is parsed later, in ProcessLastResponse.
+      FResponseHeaders.Assign(C.ResponseHeaders);
     finally
       FLastHTTPCode := C.ResponseStatusCode;
       SS.Free;
@@ -878,11 +1019,13 @@ begin
   FUserAgent := 'fp-rdap-client/1.0';
   FConnectTimeout := 15000;
   FIOTimeout := 30000;
+  FResponseHeaders := TStringList.Create;
 end;
 
 destructor TRDAPClient.Destroy;
 begin
   ClearLastState;
+  FResponseHeaders.Free;
   inherited Destroy;
 end;
 
@@ -1010,19 +1153,36 @@ constructor TRDAPClientMock.Create(const ABaseURL: string);
 begin
   inherited Create(ABaseURL);
   FMockRequests := TStringList.Create;
+  FMockHeaders := TStringList.Create;
+  // Same wire format as TFPHttpClient.ResponseHeaders ("Name: value" with a
+  // ':' name/value separator) - Assign into FResponseHeaders carries the
+  // separator over, so GetResponseHeader works the same for both.
+  FMockHeaders.NameValueSeparator := ':';
 end;
 
 destructor TRDAPClientMock.Destroy;
 begin
   FMockRequests.Free;
+  FMockHeaders.Free;
   inherited Destroy;
 end;
 
 procedure TRDAPClientMock.SetupMock(const AMockResponse: string; AHTTPCode: Integer);
 begin
+  SetupMock(AMockResponse, AHTTPCode, []);
+end;
+
+procedure TRDAPClientMock.SetupMock(const AMockResponse: string; AHTTPCode: Integer;
+  const AHeaders: array of string);
+var
+  I: Integer;
+begin
   FMockResponse := AMockResponse;
   FMockHTTPCode := AHTTPCode;
   FMockError := '';
+  FMockHeaders.Clear;
+  for I := 0 to High(AHeaders) do
+    FMockHeaders.Add(AHeaders[I]);
   FMockEnabled := True;
 end;
 
@@ -1056,6 +1216,9 @@ begin
     raise ERDAPError.Create(FMockError)
   else
   begin
+    // Same mechanism as the real client: snapshot the headers and let
+    // ProcessLastResponse parse Retry-After from them.
+    FResponseHeaders.Assign(FMockHeaders);
     FLastHTTPCode := FMockHTTPCode;
     Result := FMockResponse;
   end;
