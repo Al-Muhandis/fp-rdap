@@ -16,6 +16,16 @@ begin
     Writeln('  Title: ', C.GetObjectTitle);
     Writeln('  Type:  ', C.GetObjectType);
     Writeln('  Size:  ', Length(C.LastRawJSON));
+  end
+  else if C.LastStatus = rqsError then
+  begin
+    // 400/401/403/503 arrive as a status (not an exception) since RFC 9083
+    // error handling; network failures and unexpected codes land here too,
+    // without an HTTP status.
+    if C.LastHTTPCode > 0 then
+      WriteLn('  HTTP ', C.LastHTTPCode, ' error')
+    else
+      WriteLn('  Request failed');
   end;
   WriteLn('  Status: ', C.LastStatus);
   if C.LastErrorCode <> 0 then

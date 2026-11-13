@@ -939,8 +939,20 @@ begin
         TryParseJSON(FLastRawJSON, FLastJSON);
       end;
 
+    400, 401, 403, 503:
+      begin
+        // RFC 9083 §6.2: the body carries an error object (not guaranteed to
+        // be well-formed JSON). Reported as the rqsError status instead of an
+        // exception; the raw body stays in LastRawJSON for the caller.
+        FLastStatus := rqsError;
+        TryParseJSON(FLastRawJSON, FLastJSON);
+      end;
+
   else
     begin
+      // Codes outside the accepted list never reach this branch from the real
+      // client (TFPHttpClient raises EHTTPClient on them); the mock can feed
+      // any code, so the branch stays alive for non-standard ones.
       FLastStatus := rqsError;
       raise ERDAPError.CreateFmt('Unexpected HTTP status %d for %s',
         [FLastHTTPCode, FLastURL]);
@@ -994,7 +1006,10 @@ begin
 
     SS := TRawByteStringStream.Create;
     try
-      C.HTTPMethod('GET', AURL, SS, [200, 404, 429]);
+      // RFC 9083 §6.2 error responses (400/401/403/503) are accepted too, so
+      // ProcessLastResponse can turn them into rqsError instead of the HTTP
+      // client raising on a disallowed status.
+      C.HTTPMethod('GET', AURL, SS, [200, 400, 401, 403, 404, 429, 503]);
       Result := SS.DataString;
       // Snapshot the response headers; Assign also carries over the ':'
       // name/value separator that GetResponseHeader relies on. Retry-After

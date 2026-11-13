@@ -138,6 +138,8 @@ type
     procedure TestLastStatusNotFound;
     procedure TestNotFound_KeepsErrorBody;
     procedure TestRateLimited;
+    procedure TestErrorStatusCodes_KeepErrorObject;
+    procedure TestErrorStatus_NonJSONBody;
     procedure TestRetryAfter_Seconds;
     procedure TestRetryAfter_HTTPDate;
     procedure TestRetryAfter_AbsentAndNotCarriedOver;
@@ -969,6 +971,55 @@ begin
   AssertEquals('title extracted', 'Too many requests', FClient.LastErrorTitle);
 end;
 
+// RFC 9083 §6.2 error responses: 400/401/403/503 are reported as the rqsError
+// status (not an exception), with errorCode/title extracted from the error
+// object and the raw body kept in LastRawJSON.
+procedure TTestRDAPClient.TestErrorStatusCodes_KeepErrorObject;
+const
+  Codes: array[0..3] of Integer = (400, 401, 403, 503);
+var
+  I: Integer;
+  Title: string;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  for I := Low(Codes) to High(Codes) do
+  begin
+    Title := Format('Denied %d', [Codes[I]]);
+    FClient.SetupMock(Format('{"errorCode":%d,"title":"%s"}', [Codes[I], Title]),
+      Codes[I]);
+    FClient.QueryDomain('example.com');
+    AssertTrue(Format('%d: status is rqsError', [Codes[I]]),
+      FClient.LastStatus = rqsError);
+    AssertEquals(Format('%d: errorCode extracted', [Codes[I]]),
+      Codes[I], FClient.LastErrorCode);
+    AssertEquals(Format('%d: title extracted', [Codes[I]]),
+      Title, FClient.LastErrorTitle);
+    AssertTrue(Format('%d: body kept in LastRawJSON', [Codes[I]]),
+      Pos(Format('"errorCode":%d', [Codes[I]]), FClient.LastRawJSON) > 0);
+  end;
+
+  // The next OK response must not inherit the error state.
+  FClient.SetupMock(FMockJSON);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status OK after an error', FClient.LastStatus = rqsOK);
+  AssertEquals('errorCode not carried over', 0, FClient.LastErrorCode);
+  AssertEquals('title not carried over', '', FClient.LastErrorTitle);
+end;
+
+// An error status whose body is not JSON at all must still be a quiet
+// rqsError: nothing raises, no error object is extracted, the raw body stays.
+procedure TTestRDAPClient.TestErrorStatus_NonJSONBody;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('<html>service unavailable</html>', 403);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+  AssertEquals('no errorCode', 0, FClient.LastErrorCode);
+  AssertEquals('no title', '', FClient.LastErrorTitle);
+  AssertTrue('no parsed JSON', FClient.LastJSON = nil);
+  AssertTrue('raw body kept', Pos('service unavailable', FClient.LastRawJSON) > 0);
+end;
+
 // 429 with Retry-After in the delay-seconds form (RFC 7231 §7.1.3).
 procedure TTestRDAPClient.TestRetryAfter_Seconds;
 begin
@@ -1051,6 +1102,9 @@ begin
   AssertTrue('no question marks', Pos('?', FClient.LastErrorTitle) = 0);
 end;
 
+// 500 is outside the accepted code list: through the mock it reaches the
+// "Unexpected HTTP status" branch of ProcessLastResponse and raises, which
+// keeps that branch alive for non-standard codes.
 procedure TTestRDAPClient.TestUnexpectedStatus_Raises;
 var
   Raised: Boolean;
@@ -1065,6 +1119,8 @@ begin
     begin
       Raised := True;
       AssertTrue('message mentions status', Pos('500', E.Message) > 0);
+      AssertTrue('message mentions "Unexpected HTTP status"',
+        Pos('Unexpected HTTP status', E.Message) > 0);
     end;
     on E: Exception do
       Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
