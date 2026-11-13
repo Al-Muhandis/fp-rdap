@@ -55,7 +55,10 @@ type
   protected
     procedure SetUp; override;
     procedure TearDown; override;
-    function MakeFile(const AContent: string): string;
+    { Writes AContent to a temp file (deleted in TearDown). AEncoding = nil
+      keeps the TStringList default (system ANSI); pass TEncoding.UTF8 to
+      simulate a real bootstrap file. }
+    function MakeFile(const AContent: string; AEncoding: TEncoding = nil): string;
   end;
 
   { TTestIPUtils - pure helper functions, no I/O }
@@ -97,6 +100,7 @@ type
     procedure TestLoadFromLocalFiles_SkipsEmptyNames;
     procedure TestLoadFromLocalFiles_MissingFile;
     procedure TestLoad_InvalidJSON;
+    procedure TestLoadDNS_UTF8File;
   end;
 
   { TTestRDAPClient - client behaviour on a mocked network layer }
@@ -133,6 +137,7 @@ type
     procedure TestLastStatusNotFound;
     procedure TestNotFound_KeepsErrorBody;
     procedure TestRateLimited;
+    procedure TestErrorTitle_UTF8;
     procedure TestUnexpectedStatus_Raises;
     procedure TestNetworkError_Wrapped;
     procedure TestMalformed200JSON;
@@ -162,7 +167,7 @@ begin
   inherited TearDown;
 end;
 
-function TRDAPTestCase.MakeFile(const AContent: string): string;
+function TRDAPTestCase.MakeFile(const AContent: string; AEncoding: TEncoding): string;
 begin
   Inc(GFileCounter);
   Result := GetTempDir(False) + Format('rdap-test-%d.json', [GFileCounter]);
@@ -170,7 +175,10 @@ begin
   with TStringList.Create do
   try
     Text := AContent;
-    SaveToFile(Result);
+    if AEncoding <> nil then
+      SaveToFile(Result, AEncoding)
+    else
+      SaveToFile(Result);
   finally
     Free;
   end;
@@ -602,6 +610,20 @@ begin
   AssertTrue('ERDAPError expected', Raised);
 end;
 
+// Bootstrap files are UTF-8 (RFC 9224/9225): a non-ASCII URL stored in a
+// UTF-8 file must be read back byte-identical, not decoded as system ANSI.
+procedure TTestBootstrap.TestLoadDNS_UTF8File;
+const
+  RawTest = #$D1#$82#$D0#$B5#$D1#$81#$D1#$82; // "тест" as raw UTF-8 bytes
+begin
+  FBootstrap.LoadDNS(MakeFile(
+    '{"version":"1.0","publication":"2026-01-01T00:00:00Z","services":' +
+    '[[["test"],["https://rdap.' + RawTest + '.example/v1/"]]]}', TEncoding.UTF8));
+  AssertEquals('UTF-8 URL read back intact',
+    'https://rdap.' + RawTest + '.example/v1/',
+    FBootstrap.GetBaseURLForDomain('example.test'));
+end;
+
 { TTestRDAPClient }
 
 procedure TTestRDAPClient.SetUp;
@@ -895,6 +917,26 @@ begin
   AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
   AssertEquals('errorCode extracted', 429, FClient.LastErrorCode);
   AssertEquals('title extracted', 'Too many requests', FClient.LastErrorTitle);
+end;
+
+// RDAP payloads are UTF-8 (RFC 9083): a "title" that mixes JSON \uXXXX escapes
+// with literal UTF-8 bytes must come back as valid UTF-8, with no '?'.
+// ("привет" is escaped, "тест" is raw bytes; errorCode in a 200 body is
+// nonstandard but exercises the extraction path the same way.)
+procedure TTestRDAPClient.TestErrorTitle_UTF8;
+const
+  EscapedPart = '\u043f\u0440\u0438\u0432\u0435\u0442'; // "привет"
+  RawPart = #$D1#$82#$D0#$B5#$D1#$81#$D1#$82;           // "тест"
+  Expected = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$B2#$D0#$B5#$D1#$82 // "привет"
+    + ' ' + #$D1#$82#$D0#$B5#$D1#$81#$D1#$82;                // "тест"
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock('{"errorCode":200,"title":"' + EscapedPart + ' ' + RawPart + '"}', 200);
+  FClient.QueryDomain('example.com');
+  AssertTrue('status OK', FClient.LastStatus = rqsOK);
+  AssertEquals('errorCode extracted', 200, FClient.LastErrorCode);
+  AssertEquals('title keeps UTF-8 bytes', Expected, FClient.LastErrorTitle);
+  AssertTrue('no question marks', Pos('?', FClient.LastErrorTitle) = 0);
 end;
 
 procedure TTestRDAPClient.TestUnexpectedStatus_Raises;

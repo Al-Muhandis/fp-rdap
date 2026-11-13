@@ -179,7 +179,7 @@ begin
   if AJSON = '' then
     Exit;
   try
-    AData := GetJSON(AJSON, False);
+    AData := GetJSON(AJSON, True);
   except
     on E: Exception do
       raise ERDAPError.CreateFmt('JSON parse error: %s', [E.Message]);
@@ -193,7 +193,7 @@ begin
   if AJSON = '' then
     Exit;
   try
-    AData := GetJSON(AJSON, False);
+    AData := GetJSON(AJSON, True);
   except
     AData := nil;
   end;
@@ -531,7 +531,9 @@ begin
     raise ERDAPError.CreateFmt('Bootstrap file not found: %s', [aFileName]);
   SL := TStringList.Create;
   try
-    SL.LoadFromFile(aFileName);
+    // Bootstrap files are UTF-8 by definition (RFC 9224/9225); without an
+    // explicit encoding TStrings would decode them with the system ANSI codepage.
+    SL.LoadFromFile(aFileName, TEncoding.UTF8);
     ParseJSON(SL.Text, aData, aFileName);
   finally
     SL.Free;
@@ -1058,5 +1060,16 @@ begin
     Result := FMockResponse;
   end;
 end;
+
+initialization
+  // RDAP payloads and bootstrap files are guaranteed UTF-8 (RFC 9083/9224/9225),
+  // and all strings of this library are UTF-8 by contract. On Windows with a
+  // non-UTF-8 ANSI codepage fcl-json 3.2.2 mangles \uXXXX escapes (it decodes
+  // them to the ANSI codepage and then re-decodes the result as UTF-8) and
+  // distorts literal non-ASCII bytes (the system-codepage conversion at the
+  // GetJSON call boundary). Making the default Ansistring codepage UTF-8 turns
+  // every such conversion into an identity, so parsed strings keep their bytes.
+  // NOTE: this affects the whole process using this unit, not just the library.
+  DefaultSystemCodePage := CP_UTF8;
 
 end.

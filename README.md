@@ -92,6 +92,21 @@ tests\rdap_tests.exe --all --format=plain
 
 MIT — см. [LICENSE](LICENSE).
 
+## Изменения
+
+### 2026-11-13 — UTF-8 корректность (этап 1 дорожной карты)
+
+- Все строки библиотеки — UTF-8 по контракту. Модуль `rdapclient` в секции
+  `initialization` выставляет `DefaultSystemCodePage := CP_UTF8` на весь процесс:
+  без этого fcl-json из FPC 3.2.2 на Windows с не-UTF-8 системной кодировкой
+  портит `\uXXXX`-эскейпы и литеральные не-ASCII байты при разборе ответов
+  при любом значении флага `GetJSON`. Подключение модуля переопределяет
+  кодипейдж по умолчанию у хост-приложения — учитывайте это, если приложение
+  полагается на системную ANSI-кодировку.
+- Bootstrap-файлы читаются явно как UTF-8 (`LoadFromFile(..., TEncoding.UTF8)`):
+  раньше `TStrings` декодировал их системной ANSI-кодировкой.
+- `ParseJSONSafe`/`TryParseJSON` используют `GetJSON(..., True)`.
+
 [RFC 9082]: https://www.rfc-editor.org/rfc/rfc9082
 [RFC 9083]: https://www.rfc-editor.org/rfc/rfc9083
 [RFC 8524]: https://www.rfc-editor.org/rfc/rfc8524
