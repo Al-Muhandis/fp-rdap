@@ -101,6 +101,9 @@
         <PackageName Value="LCL"/>
       </Item>
       <Item>
+        <PackageName Value="fpidn_rt"/>
+      </Item>
+      <Item>
         <PackageName Value="FCL"/>
       </Item>
     </RequiredPackages>

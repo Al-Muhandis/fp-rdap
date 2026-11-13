@@ -26,6 +26,13 @@ function IPv6InNetwork(const aIP, aNetworkIP: TIPv6Bytes; aPrefixLen: Integer): 
 { Number of trailing domain labels shared with AKey (case-insensitive, multi-label keys such as "co.uk" are supported).
  0 means no match, so a longer key always wins over a shorter one. }
 function DomainMatchesKey(const aDomain, aKey: string): Integer;
+{ Converts a UTF-8 domain name to the A-label form expected by RFC 9082: every
+  non-ASCII label is punycode-encoded (RFC 3492, via the fp-idn package) and
+  prefixed with "xn--", ASCII labels (including already converted A-labels)
+  pass through unchanged. Punycode only - no IDNA nameprep/UTS-46 normalization
+  or case folding: an uppercase U-label encodes to an A-label other than the
+  registered (lowercase) form, so pass names in lowercase NFC. }
+function DomainToASCII(const ADomain: string): string;
 { Percent-encodes a string so it is safe to embed as a single URL path segment. }
 function EncodePathSegment(const S: string): string;
 { Parses a Retry-After header value (RFC 7231 §7.1.3): either a delay in seconds
@@ -161,9 +168,9 @@ type
     // The bootstrap is not owned by the client: create and free it yourself.
     property Bootstrap: TRDAPBootstrap read FBootstrap write FBootstrap;
 
-    { Queries the domain object for ADomain, an LDH name that must already be
-      in A-label (punycode) form: RFC 9082 expects ASCII in the URL path, and
-      non-ASCII U-labels are rejected with ERDAPError (no IDNA conversion). }
+    { Queries the domain object for ADomain. Non-ASCII U-labels are converted
+      to A-label (punycode) form before the bootstrap lookup and the request;
+      see DomainToASCII for the conversion limits. }
     function QueryDomain(const ADomain: string): string;
     function QueryIP(const AIP: string): string;
     function QueryAutNum(const AAutNum: string): string;
@@ -208,7 +215,7 @@ type
 implementation
 
 uses
-  StrUtils, fphttpclient, jsonparser, opensslsockets, openssl;
+  StrUtils, fpidn, fphttpclient, jsonparser, opensslsockets, openssl;
 
 // Single trailing-slash normalization point for base URLs, both the client's
 // BaseURL and the bootstrap URLs: appends the missing '/' before APath.
@@ -313,16 +320,12 @@ begin
       Exit(False);
 end;
 
-// True when every byte of S is ASCII (< $80). Strings are UTF-8 by contract,
-// so any byte >= $80 belongs to a multi-byte character.
-function IsASCII(const S: string): Boolean;
-var
-  I: Integer;
+// U-label to A-label conversion, one label at a time (RFC 3492 punycode,
+// fp-idn package): see the interface comment for the exact contract. Pure
+// ASCII input comes back unchanged, so LDH names are unaffected.
+function DomainToASCII(const ADomain: string): string;
 begin
-  Result := True;
-  for I := 1 to Length(S) do
-    if Ord(S[I]) >= $80 then
-      Exit(False);
+  Result := UnicodeToIDN(ADomain);
 end;
 
 // Parses an IMF-fixdate HTTP-date (RFC 7231 §7.1.1.1), e.g.
@@ -1257,12 +1260,11 @@ begin
   Domain := Trim(ADomain);
   if Domain = '' then
     raise ERDAPError.Create('Domain is empty');
-  // RFC 9082 puts the LDH name in the URL path as an A-label (punycode); a
-  // U-label would become percent-encoded UTF-8, which RDAP servers do not
-  // resolve, so it is rejected instead of sent (no IDNA conversion here).
-  if not IsASCII(Domain) then
-    raise ERDAPError.CreateFmt(
-      'Domain must be an ASCII A-label (punycode), not a U-label: %s', [Domain]);
+  // RFC 9082 puts the LDH name in the URL path as an A-label (punycode):
+  // U-labels are converted instead of rejected. The conversion runs before
+  // the bootstrap lookup - RFC 9224 bootstrap files list IDN TLD keys in
+  // A-label form (the official dns.json is ASCII-only).
+  Domain := DomainToASCII(Domain);
   if FBaseURL <> '' then
     Base := FBaseURL
   else if Assigned(FBootstrap) then

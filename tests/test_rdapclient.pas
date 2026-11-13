@@ -73,6 +73,7 @@ type
     procedure TestIPv4InNetwork_EdgePrefixes;
     procedure TestIPv6InNetwork;
     procedure TestDomainMatchesKey;
+    procedure TestDomainToASCII;
     procedure TestEncodePathSegment;
     procedure TestParseRetryAfter;
   end;
@@ -133,7 +134,9 @@ type
     procedure TestQueryDomain_UsesBootstrapBaseURL;
     procedure TestQueryDomain_NoBaseNoBootstrap;
     procedure TestQueryDomain_EmptyDomain;
-    procedure TestQueryDomain_RejectsULabel;
+    procedure TestQueryDomain_ULabelToALabel;
+    procedure TestQueryDomain_ALabelPassThrough;
+    procedure TestQueryDomain_BootstrapWithULabel;
     procedure TestQueryDomain_EncodesPath;
     procedure TestQueryIP_Mock;
     procedure TestQueryIP_IPv6;
@@ -345,6 +348,28 @@ begin
   AssertEquals('no match', 0, DomainMatchesKey('example.com', 'net'));
   AssertEquals('partial label does not match', 0, DomainMatchesKey('example.com', 'ample.com'));
   AssertEquals('longer domain than key', 1, DomainMatchesKey('example.com', 'com'));
+end;
+
+// U-label -> A-label conversion (RFC 3492 punycode, fp-idn package). Raw byte
+// escapes keep the test independent of the system codepage (stage 1 notes);
+// the expected A-labels are the well-known punycode forms of these names.
+procedure TTestIPUtils.TestDomainToASCII;
+const
+  Prm = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80; // "пример"
+  ULabelRF = Prm + '.' + #$D1#$80#$D1#$84;                // "пример.рф"
+  BUCHER = 'b' + #$C3#$BC + 'cher';                       // "bücher"
+begin
+  // LDH and already-converted names pass through byte-identical (no folding).
+  AssertEquals('ASCII passthrough', 'example.com', DomainToASCII('example.com'));
+  AssertEquals('ASCII case kept', 'Example.COM', DomainToASCII('Example.COM'));
+  AssertEquals('A-label passthrough', 'xn--e1afmkfd.xn--p1ai',
+    DomainToASCII('xn--e1afmkfd.xn--p1ai'));
+  AssertEquals('empty', '', DomainToASCII(''));
+  // Each non-ASCII label becomes "xn--" + punycode.
+  AssertEquals('full U-label name', 'xn--e1afmkfd.xn--p1ai', DomainToASCII(ULabelRF));
+  AssertEquals('mixed LDH + U-label', 'xn--e1afmkfd.com', DomainToASCII(Prm + '.com'));
+  AssertEquals('RFC 3492 vector', 'xn--bcher-kva.example',
+    DomainToASCII(BUCHER + '.example'));
 end;
 
 procedure TTestIPUtils.TestEncodePathSegment;
@@ -1011,41 +1036,63 @@ begin
   AssertEquals('no request performed', 0, FClient.MockRequestCount);
 end;
 
-// RFC 9082 expects A-labels (punycode) in the URL path; a U-label would be
-// sent as percent-encoded UTF-8 that RDAP servers do not resolve. Raw byte
-// escapes keep the test independent of the system codepage (stage 1 notes).
-procedure TTestRDAPClient.TestQueryDomain_RejectsULabel;
+// RFC 9082 expects A-labels (punycode) in the URL path: a U-label is converted
+// to its A-label form instead of being rejected (the pre-backlog behavior).
+// Raw byte escapes keep the test independent of the system codepage (stage 1
+// notes).
+procedure TTestRDAPClient.TestQueryDomain_ULabelToALabel;
 const
-  ULabel = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80 + '.' +
-    #$D1#$80#$D1#$84; // "пример.рф" as raw UTF-8 bytes
-var
-  Raised: Boolean;
-
-  procedure ExpectRejected(const ADomain: string);
-  begin
-    Raised := False;
-    try
-      FClient.QueryDomain(ADomain);
-    except
-      on E: ERDAPError do
-      begin
-        Raised := True;
-        AssertTrue('message mentions ASCII', Pos('ASCII', E.Message) > 0);
-      end;
-      on E: Exception do
-        Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
-    end;
-    AssertTrue('ERDAPError expected', Raised);
-  end;
-
+  Prm = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80; // "пример"
+  ULabelRF = Prm + '.' + #$D1#$80#$D1#$84;                // "пример.рф"
 begin
   FClient.BaseURL := 'https://rdap.example.org';
   FClient.SetupMock(FMockJSON);
+  AssertEquals('raw JSON returned', FMockJSON, FClient.QueryDomain(ULabelRF));
+  AssertEquals('U-label converted to A-label',
+    'https://rdap.example.org/domain/xn--e1afmkfd.xn--p1ai', FClient.LastURL);
+  // A mixed LDH + U-label name converts only the non-ASCII label.
+  FClient.QueryDomain(Prm + '.com');
+  AssertEquals('mixed name converted',
+    'https://rdap.example.org/domain/xn--e1afmkfd.com', FClient.LastURL);
+end;
 
-  ExpectRejected(ULabel);
-  // A mixed LDH + U-label name is rejected as well.
-  ExpectRejected('example.' + #$D1#$80#$D1#$84);
-  AssertEquals('no request performed', 0, FClient.MockRequestCount);
+procedure TTestRDAPClient.TestQueryDomain_ALabelPassThrough;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+  FClient.QueryDomain('xn--e1afmkfd.xn--p1ai');
+  AssertEquals('already-converted A-label unchanged',
+    'https://rdap.example.org/domain/xn--e1afmkfd.xn--p1ai', FClient.LastURL);
+end;
+
+// The conversion runs before the bootstrap lookup: RFC 9224 files list IDN
+// TLD keys in A-label form (the official dns.json is ASCII-only), so the
+// U-label must be converted to hit the right service entry.
+procedure TTestRDAPClient.TestQueryDomain_BootstrapWithULabel;
+const
+  BootstrapDNSIDN =
+    '{' +
+    '  "services": [' +
+    '    [["xn--p1ai"], ["https://rdap.tld.rf/"]],' +
+    '    [["com"], ["https://rdap.verisign.com/com/v1/"]]' +
+    '  ]' +
+    '}';
+var
+  B: TRDAPBootstrap;
+begin
+  B := TRDAPBootstrap.Create;
+  try
+    B.LoadDNSFromString(BootstrapDNSIDN);
+    FClient.Bootstrap := B;
+    FClient.SetupMock(FMockJSON);
+    FClient.QueryDomain(
+      #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80 + '.' +
+      #$D1#$80#$D1#$84); // "пример.рф"
+    AssertEquals('bootstrap entry found via converted A-label',
+      'https://rdap.tld.rf/domain/xn--e1afmkfd.xn--p1ai', FClient.LastURL);
+  finally
+    B.Free;
+  end;
 end;
 
 procedure TTestRDAPClient.TestQueryDomain_EncodesPath;

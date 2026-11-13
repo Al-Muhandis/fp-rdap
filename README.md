@@ -7,6 +7,8 @@ RDAP ([RFC 9082]/[RFC 9083]) с роутингом через официальн
 ## Возможности
 
 - Запросы: `domain`, `ip`, `autnum`, `entity`.
+- IDNA: U-label домены (например, `пример.рф`) конвертируются в A-label
+  (punycode, RFC 3492) до запроса и поиска в bootstrap.
 - Автоматический выбор RDAP-сервера по домену (multi-label TLD, `co.uk`) или IP
   (longest-prefix-wins) из bootstrap-файлов IANA; bootstrap-файлы грузятся с диска или из строки.
 - Статусы результата: `rqsOK`, `rqsNotFound`, `rqsRateLimited`, `rqsError` + разбор
@@ -27,8 +29,9 @@ RDAP ([RFC 9082]/[RFC 9083]) с роутингом через официальн
 ## Установка
 
 Установите пакет `rdap_rt.lpk` в Lazarus (Package → Open → Install) или просто добавьте
-`src/rdapclient.pas` в проект. Требуется FPC 3.2+, FCL (fpjson, fphttpclient) и OpenSSL
-библиотеки в PATH для HTTPS.
+`src/rdapclient.pas` в проект. Требуется FPC 3.2+, FCL (fpjson, fphttpclient), пакет
+[`fpidn_rt`](https://github.com/al-muhandis/fp-idn) (fp-idn, punycode для IDNA-конвертации)
+и OpenSSL библиотеки в PATH для HTTPS.
 
 ## Быстрый старт
 
@@ -92,15 +95,37 @@ tests\rdap_tests.exe --all --format=plain
 ## Ограничения
 
 - Клиент не потокобезопасен: один экземпляр на поток.
-- Домены в запросах — A-label (punycode); U-label (например, `пример.рф`)
-  отклоняются с `ERDAPError` (IDNA-конвертация не поддерживается).
-- Ответ HTTP-сервера не ограничен по размеру.
+- IDNA-конвертация — только punycode (RFC 3492, через fp-idn): без нормализации
+  nameprep/UTS-46 и приведения регистра. ASCII-имена (включая уже готовые
+  A-label) проходят без изменений, поэтому U-label передавайте в нижнем регистре
+  NFC: `ПРИМЕР.РФ` закодируется в посторонний (незарегистрированный) A-label.
+- Ответ больше `MaxResponseSize` (по умолчанию 10 МБ) обрывается с `ERDAPError`;
+  0 отключает лимит.
 
 ## Лицензия
 
 MIT — см. [LICENSE](LICENSE).
 
 ## Изменения
+
+### 2026-11-14 — IDNA: U-label конвертируются в A-label (бэклог)
+
+- **Изменение поведения:** `QueryDomain` больше не отклоняет не-ASCII домены
+  (U-label): каждый не-ASCII label конвертируется в punycode A-label
+  (`пример.рф` → `xn--e1afmkfd.xn--p1ai`, RFC 3492 через пакет fp-idn) до
+  поиска bootstrap-сервера и отправки запроса. Раньше такой домен отклонялся
+  с `ERDAPError` («Domain must be an ASCII A-label…»).
+- Конвертация выполняется до выбора сервера: официальные bootstrap-файлы
+  RFC 9224 перечисляют IDN-TLD ключи в A-label форме (`dns.json` — чисто
+  ASCII), поэтому U-label домены теперь корректно маршрутизируются.
+- Новый чистый хелпер `DomainToASCII` (экспортирован для тестов): ASCII-имена,
+  включая уже готовые A-label, проходят байт-в-байт; конвертация — только
+  punycode, без nameprep/UTS-46 нормализации и приведения регистра
+  (подробности — в «Ограничениях»).
+- Новая зависимость: runtime-пакет `fpidn_rt` ([fp-idn](https://github.com/al-muhandis/fp-idn)),
+  требуется для `rdap_rt.lpk`.
+- README: в «Ограничениях» исправлен устаревший пункт про неограниченный
+  размер ответа (противоречил `MaxResponseSize` из предыдущей записи бэклога).
 
 ### 2026-11-14 — Ограничение размера HTTP-ответа (бэклог)
 

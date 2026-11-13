@@ -19,6 +19,9 @@
     </RunParams>
     <RequiredPackages>
       <Item>
+        <PackageName Value="fpidn_rt"/>
+      </Item>
+      <Item>
         <PackageName Value="FCL"/>
       </Item>
     </RequiredPackages>
