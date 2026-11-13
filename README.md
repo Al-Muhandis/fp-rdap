@@ -83,6 +83,11 @@ tests\rdap_tests.exe --all --format=plain
 `demo/rdap_demo.lpi` — положите рядом с exe файлы `dns.json`, `ipv4.json`, `ipv6.json`
 с https://data.iana.org/rdap/ ; без них демо уходит через `https://rdap.org/`.
 
+На Windows демо переключает вывод консоли в UTF-8 (`SetConsoleOutputCP`) на время
+работы и возвращает прежний кодипейдж при выходе — не-ASCII строки (названия
+объектов, error-сообщения, JSON-превью) печатаются без mojibake; нужен шрифт
+консоли с поддержкой Unicode (в современных Windows он по умолчанию).
+
 ## Ограничения
 
 - Клиент не потокобезопасен: один экземпляр на поток.

@@ -3,7 +3,13 @@ program rdap_demo;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Classes, rdapclient;
+  SysUtils, Classes, rdapclient
+  {$IFDEF MSWINDOWS}, Windows{$ENDIF};
+
+{$IFDEF MSWINDOWS}
+var
+  OldOutputCP: Cardinal;
+{$ENDIF}
 
 // Replaces characters that are not allowed in Windows file names (and control
 // characters) with '_', so any query string can serve as a file name base
@@ -119,6 +125,17 @@ begin
 end;
 
 begin
+  {$IFDEF MSWINDOWS}
+  // Library strings are UTF-8 by contract, while a Windows console usually
+  // starts in the OEM codepage (e.g. cp866), which would garble non-ASCII
+  // titles, error messages and JSON previews into mojibake. Switch the console
+  // output to UTF-8 for the run (needs a Unicode-capable console font, e.g.
+  // Consolas) and restore the previous codepage on exit. UTF8ToConsole was
+  // considered and rejected: cp866 cannot represent most non-Cyrillic
+  // characters, RDAP data is international.
+  OldOutputCP := GetConsoleOutputCP;
+  SetConsoleOutputCP(CP_UTF8);
+  {$ENDIF}
   try
     RunDemos;
   except
@@ -127,4 +144,7 @@ begin
   end;
   Writeln('COMPLETE!');
   ReadLn;
+  {$IFDEF MSWINDOWS}
+  SetConsoleOutputCP(OldOutputCP);
+  {$ENDIF}
 end.
