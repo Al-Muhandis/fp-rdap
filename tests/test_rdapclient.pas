@@ -102,6 +102,11 @@ type
     procedure TestLoadFromLocalFiles_MissingFile;
     procedure TestLoad_InvalidJSON;
     procedure TestLoadDNS_UTF8File;
+    procedure TestLoadDNSFromString;
+    procedure TestLoadDNSFromString_InvalidJSON;
+    procedure TestFailedReload_KeepsPreviousData;
+    procedure TestServiceURL_MalformedURLs;
+    procedure TestLoadIPv4IPv6FromString;
   end;
 
   { TTestRDAPClient - client behaviour on a mocked network layer }
@@ -657,6 +662,184 @@ begin
   AssertEquals('UTF-8 URL read back intact',
     'https://rdap.' + RawTest + '.example/v1/',
     FBootstrap.GetBaseURLForDomain('example.test'));
+end;
+
+procedure TTestBootstrap.TestLoadDNSFromString;
+var
+  Raised: Boolean;
+begin
+  FBootstrap.LoadDNSFromString(BootstrapDNS);
+  AssertEquals('com via embedded string', 'https://rdap.verisign.com/com/v1/',
+    FBootstrap.GetBaseURLForDomain('example.com'));
+  AssertEquals('ru via embedded string', 'https://rdap.tcinet.ru/',
+    FBootstrap.GetBaseURLForDomain('example.ru'));
+
+  // Repeated load fully replaces the content.
+  FBootstrap.LoadDNSFromString('{"services":[[["ru"],["https://rdap2.tcinet.ru/"]]]}');
+  AssertEquals('content replaced by reload', 'https://rdap2.tcinet.ru/',
+    FBootstrap.GetBaseURLForDomain('example.ru'));
+
+  // ...and the keys of the previous load are gone.
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForDomain('example.com');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('old keys are gone after reload', Raised);
+end;
+
+procedure TTestBootstrap.TestLoadDNSFromString_InvalidJSON;
+var
+  Raised: Boolean;
+begin
+  Raised := False;
+  try
+    FBootstrap.LoadDNSFromString('not json at all');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions JSON parse', Pos('JSON parse', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+
+  Raised := False;
+  try
+    FBootstrap.LoadDNSFromString('');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('empty string raises too', Raised);
+
+  // Nothing was loaded, so lookups still report the bootstrap as unloaded.
+  Raised := False;
+  try
+    FBootstrap.GetBaseURLForDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('still "not loaded"', Pos('not loaded', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('bootstrap stays unloaded', Raised);
+end;
+
+// Parse-then-swap: a failed reload (garbage file, valid JSON without
+// "services", missing file) must leave the previously loaded bootstrap
+// fully operational.
+procedure TTestBootstrap.TestFailedReload_KeepsPreviousData;
+var
+  Raised: Boolean;
+begin
+  FBootstrap.LoadDNS(MakeFile(BootstrapDNS));
+
+  Raised := False;
+  try
+    FBootstrap.LoadDNS(MakeFile('this is not json'));
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('mentions JSON parse', Pos('JSON parse', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('old DNS data survives a broken reload', 'https://rdap.pir.org/',
+    FBootstrap.GetBaseURLForDomain('example.org'));
+
+  Raised := False;
+  try
+    FBootstrap.LoadDNS(MakeFile('{"version":"1.0"}'));
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('old DNS data survives a services-less reload',
+    'https://rdap.verisign.com/com/v1/',
+    FBootstrap.GetBaseURLForDomain('example.com'));
+
+  Raised := False;
+  try
+    FBootstrap.LoadDNS('no-such-bootstrap-file.json');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('old DNS data survives a missing file', 'https://rdap.tcinet.ru/',
+    FBootstrap.GetBaseURLForDomain('example.ru'));
+end;
+
+procedure TTestBootstrap.TestServiceURL_MalformedURLs;
+var
+  Raised: Boolean;
+
+  // Loads AJSON as the DNS bootstrap and expects the lookup of example.com
+  // (key "com") to fail with ERDAPError whose message contains AFragment -
+  // which includes the entry number, as every ServiceURL error must.
+  procedure ExpectLookupError(const AJSON, AFragment: string);
+  begin
+    FBootstrap.LoadDNSFromString(AJSON);
+    Raised := False;
+    try
+      FBootstrap.GetBaseURLForDomain('example.com');
+    except
+      on E: ERDAPError do
+      begin
+        Raised := True;
+        AssertTrue('"' + AFragment + '" expected in "' + E.Message + '"',
+          Pos(AFragment, E.Message) > 0);
+      end;
+      on E: Exception do
+        Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+    end;
+    AssertTrue('ERDAPError expected', Raised);
+  end;
+
+begin
+  // URL element that is not a string (a number)
+  ExpectLookupError('{"services":[[["com"],[123]]]}',
+    'Service 0: URL 0 is not a string');
+  // Empty URL string
+  ExpectLookupError('{"services":[[["com"],[""]]]}',
+    'Service 0 has an empty base URL');
+  // Empty URL array
+  ExpectLookupError('{"services":[[["com"],[]]]}',
+    'Service 0 has an empty URL list');
+  // URL part of a wrong type (neither array nor string)
+  ExpectLookupError('{"services":[[["com"],{"url":"https://x/"}]]}',
+    'Service 0: URL part is neither an array nor a string');
+end;
+
+// The string variants of the IP bootstraps work like LoadDNSFromString.
+procedure TTestBootstrap.TestLoadIPv4IPv6FromString;
+begin
+  FBootstrap.LoadIPv4FromString(BootstrapIPv4);
+  FBootstrap.LoadIPv6FromString(BootstrapIPv6);
+  AssertEquals('IPv4 via string', 'https://rdap.lucky.example/',
+    FBootstrap.GetBaseURLForIP('8.8.8.8'));
+  AssertEquals('IPv6 via string', 'https://rdap.db8.example/',
+    FBootstrap.GetBaseURLForIP('2001:db8::1'));
 end;
 
 { TTestRDAPClient }

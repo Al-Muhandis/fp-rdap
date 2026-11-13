@@ -54,6 +54,12 @@ type
     procedure LoadJSON(const aFileName: string; out aData: TJSONData);
     procedure ParseJSON(const aJSON: string; out aData: TJSONData; const aKind: string);
     procedure LoadServices(aData: TJSONData; out aServices: TJSONArray; const aKind: string);
+    // Parse-then-swap core of the Load* methods: validates the freshly parsed
+    // aNewData ("services" array) and only on full success replaces aData and
+    // aServices. Takes over ownership of aNewData: freed on a validation
+    // error, so a failed reload leaves the previously loaded data intact.
+    procedure InstallServices(aNewData: TJSONData; var aData: TJSONData;
+      var aServices: TJSONArray; const aKind: string);
     function FindDNSService(const aDomain: string): Integer;
     function FindIPv4Service(aIP: Cardinal): Integer;
     function FindIPv6Service(const aIP: TIPv6Bytes): Integer;
@@ -63,6 +69,9 @@ type
     { Loads the DNS bootstrap from a raw JSON string (embedded snapshot
       fallback when the canonical file is not deployed next to the exe). }
     procedure LoadDNSFromString(const aJSON: string);
+    { String variants of LoadIPv4/LoadIPv6, symmetric to LoadDNSFromString. }
+    procedure LoadIPv4FromString(const aJSON: string);
+    procedure LoadIPv6FromString(const aJSON: string);
     procedure LoadDNS(const aFileName: string = 'dns.json');
     procedure LoadIPv4(const aFileName: string = 'ipv4.json');
     procedure LoadIPv6(const aFileName: string = 'ipv6.json');
@@ -679,6 +688,24 @@ begin
     raise ERDAPError.CreateFmt('No "services" array in %s bootstrap', [aKind]);
 end;
 
+procedure TRDAPBootstrap.InstallServices(aNewData: TJSONData; var aData: TJSONData;
+  var aServices: TJSONArray; const aKind: string);
+var
+  NewServices: TJSONArray;
+begin
+  try
+    LoadServices(aNewData, NewServices, aKind);
+  except
+    aNewData.Free;
+    raise;
+  end;
+  // Full success: swap fields. aServices still points into the old aData
+  // tree, so repoint it before that tree is freed.
+  aServices := NewServices;
+  aData.Free;
+  aData := aNewData;
+end;
+
 // Service entry layout check: [ [keys...], [urls...] ].
 function TryGetServiceKeys(AService: TJSONData; out AKeys: TJSONArray): Boolean;
 var
@@ -772,19 +799,40 @@ begin
   end;
 end;
 
+// Base URL of service entry aIndex ([ [keys...], urls ]). The entry layout is
+// validated strictly - urls is an array of strings (a single URL string is
+// tolerated as well) - so a malformed bootstrap entry raises ERDAPError naming
+// the entry, never a bare EConvertError/EJSONError from fpjson.
 function TRDAPBootstrap.ServiceURL(aServices: TJSONArray; aIndex: Integer): string;
 var
-  Service: TJSONArray;
+  Service, URLs: TJSONArray;
+  I: Integer;
 begin
+  if (aIndex < 0) or (aIndex >= aServices.Count) then
+    raise ERDAPError.CreateFmt('Service %d: entry index out of range', [aIndex]);
+  if aServices.Types[aIndex] <> jtArray then
+    raise ERDAPError.CreateFmt('Service %d: entry is not an array', [aIndex]);
   Service := aServices.Arrays[aIndex];
-  if Service.Types[1] = jtArray then
-  begin
-    if Service.Arrays[1].Count = 0 then
-      raise ERDAPError.CreateFmt('Service %d has an empty URL list', [aIndex]);
-    Result := Service.Arrays[1].Strings[0];
-  end
+  if Service.Count < 2 then
+    raise ERDAPError.CreateFmt('Service %d: entry has no URL part', [aIndex]);
+  case Service.Types[1] of
+    jtString:
+      Result := Service.Strings[1];
+    jtArray:
+      begin
+        URLs := Service.Arrays[1];
+        if URLs.Count = 0 then
+          raise ERDAPError.CreateFmt('Service %d has an empty URL list', [aIndex]);
+        for I := 0 to URLs.Count - 1 do
+          if URLs.Types[I] <> jtString then
+            raise ERDAPError.CreateFmt('Service %d: URL %d is not a string',
+              [aIndex, I]);
+        Result := URLs.Strings[0];
+      end;
   else
-    Result := Service.Strings[1];
+    raise ERDAPError.CreateFmt(
+      'Service %d: URL part is neither an array nor a string', [aIndex]);
+  end;
   if Result = '' then
     raise ERDAPError.CreateFmt('Service %d has an empty base URL', [aIndex]);
 end;
@@ -797,36 +845,55 @@ begin
   inherited Destroy;
 end;
 
+// All Load* methods are parse-then-swap: the new tree is parsed and validated
+// into temporaries first, the fields are replaced only on full success, so a
+// failed reload keeps the previously loaded bootstrap operational.
 procedure TRDAPBootstrap.LoadDNSFromString(const aJSON: string);
+var
+  NewData: TJSONData;
 begin
-  FreeAndNil(fDNSData);
-  fServicesDNS := nil;
-  ParseJSON(aJSON, fDNSData, 'DNS');
-  LoadServices(fDNSData, fServicesDNS, 'DNS');
+  ParseJSON(aJSON, NewData, 'DNS');
+  InstallServices(NewData, fDNSData, fServicesDNS, 'DNS');
+end;
+
+procedure TRDAPBootstrap.LoadIPv4FromString(const aJSON: string);
+var
+  NewData: TJSONData;
+begin
+  ParseJSON(aJSON, NewData, 'IPv4');
+  InstallServices(NewData, fIPv4Data, fServicesIPv4, 'IPv4');
+end;
+
+procedure TRDAPBootstrap.LoadIPv6FromString(const aJSON: string);
+var
+  NewData: TJSONData;
+begin
+  ParseJSON(aJSON, NewData, 'IPv6');
+  InstallServices(NewData, fIPv6Data, fServicesIPv6, 'IPv6');
 end;
 
 procedure TRDAPBootstrap.LoadDNS(const aFileName: string);
+var
+  NewData: TJSONData;
 begin
-  FreeAndNil(fDNSData);
-  fServicesDNS := nil;
-  LoadJSON(aFileName, fDNSData);
-  LoadServices(fDNSData, fServicesDNS, 'DNS');
+  LoadJSON(aFileName, NewData);
+  InstallServices(NewData, fDNSData, fServicesDNS, 'DNS');
 end;
 
 procedure TRDAPBootstrap.LoadIPv4(const aFileName: string);
+var
+  NewData: TJSONData;
 begin
-  FreeAndNil(fIPv4Data);
-  fServicesIPv4 := nil;
-  LoadJSON(aFileName, fIPv4Data);
-  LoadServices(fIPv4Data, fServicesIPv4, 'IPv4');
+  LoadJSON(aFileName, NewData);
+  InstallServices(NewData, fIPv4Data, fServicesIPv4, 'IPv4');
 end;
 
 procedure TRDAPBootstrap.LoadIPv6(const aFileName: string);
+var
+  NewData: TJSONData;
 begin
-  FreeAndNil(fIPv6Data);
-  fServicesIPv6 := nil;
-  LoadJSON(aFileName, fIPv6Data);
-  LoadServices(fIPv6Data, fServicesIPv6, 'IPv6');
+  LoadJSON(aFileName, NewData);
+  InstallServices(NewData, fIPv6Data, fServicesIPv6, 'IPv6');
 end;
 
 procedure TRDAPBootstrap.LoadFromLocalFiles(const aDNSFile: string; const aIPv4File: string; const aIPv6File: string);
