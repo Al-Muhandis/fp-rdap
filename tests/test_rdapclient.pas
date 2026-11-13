@@ -374,7 +374,8 @@ begin
   AssertTrue('past date', TryParseRetryAfter('Sat, 01 Jan 2000 00:00:00 GMT', S));
   AssertEquals('past date value', 0, S);
   AssertTrue('future date', TryParseRetryAfter('Sat, 01 Jan 2050 00:00:00 GMT', S));
-  AssertTrue('future date value in range', (S > 0) and (S <= MaxInt));
+  // Upper bound is guaranteed by the API (out Integer, values clamped internally).
+  AssertTrue('future date value positive', S > 0);
   AssertFalse('date without GMT', TryParseRetryAfter('Sat, 01 Jan 2050 00:00:00 UTC', S));
   AssertFalse('obsolete RFC 850 date', TryParseRetryAfter('Sunday, 06-Nov-94 08:49:37 GMT', S));
   AssertFalse('bad month', TryParseRetryAfter('Sun, 06 Foo 1994 08:49:37 GMT', S));
