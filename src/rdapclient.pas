@@ -95,6 +95,7 @@ type
     FUserAgent: string;
     FConnectTimeout: Integer;
     FIOTimeout: Integer;
+    FMaxResponseSize: Int64;
     FSSLInitialized: Boolean;
     FLastRawJSON: string;
     FLastJSON: TJSONData;
@@ -122,6 +123,12 @@ type
     // Performs the actual HTTP GET and returns the response body.
     // Override to mock the network layer in tests.
     function DoHTTPGetJSON(const AURL, AUserAgent: string): string; virtual;
+    // Raises ERDAPError when ASize exceeds MaxResponseSize (0 = no limit);
+    // a body of exactly the limit is accepted. The real download aborts
+    // mid-read in TLimitedResponseStream; this check applies the same
+    // contract to whatever DoHTTPGetJSON returned - the path the mock
+    // (and hence the tests) exercises.
+    procedure CheckResponseLimit(const AURL: string; ASize: Int64);
   public
     constructor Create(const ABaseURL: string = ''); virtual;
     destructor Destroy; override;
@@ -130,6 +137,11 @@ type
     property UserAgent: string read FUserAgent write FUserAgent;
     property ConnectTimeout: Integer read FConnectTimeout write FConnectTimeout;
     property IOTimeout: Integer read FIOTimeout write FIOTimeout;
+    { Maximum accepted response body size in bytes (default 10 MB): a larger
+      response aborts the download with ERDAPError instead of growing memory
+      without bound - protection against broken or hostile servers.
+      0 (or less) disables the limit. }
+    property MaxResponseSize: Int64 read FMaxResponseSize write FMaxResponseSize;
 
     property LastRawJSON: string read FLastRawJSON;
     { JSON tree of the last response. Owned by the client and invalidated by
@@ -990,6 +1002,41 @@ begin
   Result := ServiceURL(Services, Idx);
 end;
 
+{ TLimitedResponseStream }
+
+// Download buffer of DoHTTPGetJSON: aborts the HTTP read with ERDAPError as
+// soon as the total body exceeds AMaxSize bytes (0 = unlimited), so a broken
+// or hostile server cannot exhaust memory. fphttpclient calls Write directly
+// in its read loop (no wrapping except), so the exception terminates the
+// download; the true total is unknown at that point - the message reports the
+// minimum size seen so far.
+type
+  TLimitedResponseStream = class(TRawByteStringStream)
+  private
+    FMaxSize: Int64;
+    FURL: string;
+  public
+    constructor Create(AMaxSize: Int64; const AURL: string);
+    function Write(const ABuffer; ACount: LongInt): LongInt; override;
+  end;
+
+constructor TLimitedResponseStream.Create(AMaxSize: Int64; const AURL: string);
+begin
+  inherited Create;
+  FMaxSize := AMaxSize;
+  FURL := AURL;
+end;
+
+function TLimitedResponseStream.Write(const ABuffer; ACount: LongInt): LongInt;
+begin
+  // Size is the byte count accumulated so far (TBytesStream tracks it).
+  if (FMaxSize > 0) and (Size + ACount > FMaxSize) then
+    raise ERDAPError.CreateFmt(
+      'Response from %s exceeds the size limit: at least %d > %d bytes',
+      [FURL, Size + ACount, FMaxSize]);
+  Result := inherited Write(ABuffer, ACount);
+end;
+
 { TRDAPClient }
 
 procedure TRDAPClient.ClearLastState;
@@ -1113,7 +1160,9 @@ begin
     C.AddHeader('User-Agent', AUserAgent);
     C.AddHeader('Accept', 'application/rdap+json,*/*');
 
-    SS := TRawByteStringStream.Create;
+    // The download buffer enforces MaxResponseSize: a body over the limit
+    // aborts the read with ERDAPError instead of accumulating unbounded data.
+    SS := TLimitedResponseStream.Create(FMaxResponseSize, AURL);
     try
       // RFC 9083 §6.2 error responses (400/401/403/503) are accepted too, so
       // ProcessLastResponse can turn them into rqsError instead of the HTTP
@@ -1142,6 +1191,9 @@ begin
   FUserAgent := 'fp-rdap-client/1.0';
   FConnectTimeout := 15000;
   FIOTimeout := 30000;
+  // 10 MB: real RDAP responses are far smaller; the default limit only guards
+  // against broken or hostile servers dumping unbounded data.
+  FMaxResponseSize := 10 * 1024 * 1024;
   FResponseHeaders := TStringList.Create;
 end;
 
@@ -1152,15 +1204,30 @@ begin
   inherited Destroy;
 end;
 
+// Shared response-size contract of ExecuteQuery: applies MaxResponseSize to
+// whatever DoHTTPGetJSON returned (the real download aborts earlier, in
+// TLimitedResponseStream). The body reaches LastRawJSON only after this check.
+procedure TRDAPClient.CheckResponseLimit(const AURL: string; ASize: Int64);
+begin
+  if (FMaxResponseSize > 0) and (ASize > FMaxResponseSize) then
+    raise ERDAPError.CreateFmt(
+      'Response from %s exceeds the size limit: %d > %d bytes',
+      [AURL, ASize, FMaxResponseSize]);
+end;
+
 function TRDAPClient.ExecuteQuery(const APath, ABase: string): string;
 var
   URL: string;
+  Body: string;
 begin
   ClearLastState;
   URL := NormalizePath(ABase, APath);
   FLastURL := URL;
   try
-    FLastRawJSON := DoHTTPGetJSON(URL, FUserAgent);
+    // The body is kept out of LastRawJSON until it passes the size check.
+    Body := DoHTTPGetJSON(URL, FUserAgent);
+    CheckResponseLimit(URL, Length(Body));
+    FLastRawJSON := Body;
   except
     on E: Exception do
     begin

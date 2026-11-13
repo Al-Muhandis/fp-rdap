@@ -123,6 +123,10 @@ type
   published
     procedure TestConstructor;
     procedure TestConstructor_BaseURLStoredAsIs;
+    procedure TestMaxResponseSize_Default;
+    procedure TestMaxResponseSize_Exceeded;
+    procedure TestMaxResponseSize_Boundary;
+    procedure TestMaxResponseSize_Unlimited;
     procedure TestQueryDomain_Mock;
     procedure TestQueryDomain_BaseURLNormalized;
     procedure TestQueryDomain_BaseURLOverridesBootstrap;
@@ -1463,6 +1467,91 @@ begin
       Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
   end;
   AssertTrue('ERDAPError expected', Raised);
+end;
+
+// MaxResponseSize is part of ExecuteQuery's contract (applied to whatever
+// DoHTTPGetJSON returns), so the mock path exercises it exactly like the wire
+// path - no network needed.
+procedure TTestRDAPClient.TestMaxResponseSize_Default;
+begin
+  AssertEquals('default limit is 10 MB', Int64(10 * 1024 * 1024),
+    FClient.MaxResponseSize);
+end;
+
+// A body over the limit fails the query with ERDAPError naming the limit;
+// the oversized body must not leak into LastRawJSON, the status is rqsError.
+procedure TTestRDAPClient.TestMaxResponseSize_Exceeded;
+var
+  Raised: Boolean;
+  Body: string;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  Body := StringOfChar('x', 64);
+  FClient.SetupMock(Body);
+  FClient.MaxResponseSize := 16;
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions the limit', Pos('size limit', E.Message) > 0);
+      AssertTrue('message mentions the URL', Pos('rdap.example.org', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+  AssertEquals('oversized body not kept in LastRawJSON', 0,
+    Length(FClient.LastRawJSON));
+  AssertEquals('request still recorded', 1, FClient.MockRequestCount);
+end;
+
+// The limit is inclusive: a body of exactly MaxResponseSize bytes passes,
+// one byte more fails. The bodies are valid JSON so they parse cleanly once
+// they pass the size check.
+procedure TTestRDAPClient.TestMaxResponseSize_Boundary;
+var
+  Raised: Boolean;
+  Body: string;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  Body := '{"pad":"' + StringOfChar('x', 20) + '"}';
+  FClient.SetupMock(Body);
+  FClient.MaxResponseSize := Length(Body);
+  FClient.QueryDomain('example.com');
+  AssertTrue('body of exactly the limit passes', FClient.LastStatus = rqsOK);
+  AssertEquals('body stored in full', Length(Body), Length(FClient.LastRawJSON));
+
+  FClient.SetupMock(Body);
+  FClient.MaxResponseSize := Length(Body) - 1;
+  Raised := False;
+  try
+    FClient.QueryDomain('example.com');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('one byte over the limit must raise', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+end;
+
+// MaxResponseSize = 0 disables the limit: any body size is accepted.
+procedure TTestRDAPClient.TestMaxResponseSize_Unlimited;
+var
+  Body: string;
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  Body := '{"pad":"' + StringOfChar('x', 4090) + '"}';
+  FClient.SetupMock(Body);
+  FClient.MaxResponseSize := 0;
+  FClient.QueryDomain('example.com');
+  AssertTrue('no limit, status OK', FClient.LastStatus = rqsOK);
+  AssertEquals('body stored in full', Length(Body), Length(FClient.LastRawJSON));
 end;
 
 procedure TTestRDAPClient.TestMockRecordsRequests;
