@@ -5,6 +5,21 @@ program rdap_demo;
 uses
   SysUtils, Classes, rdapclient;
 
+// Replaces characters that are not allowed in Windows file names (and control
+// characters) with '_', so any query string can serve as a file name base
+// (e.g. an IPv6 query contains ':').
+function SanitizeFileName(const S: string): string;
+const
+  Forbidden = '<>:"/\|?*';
+var
+  I: Integer;
+begin
+  Result := S;
+  for I := 1 to Length(Result) do
+    if (Pos(Result[I], Forbidden) > 0) or (Ord(Result[I]) < 32) then
+      Result[I] := '_';
+end;
+
 procedure PrintResult(C: TRDAPClient; const aQuery, aCaption: string);
 begin
   Writeln('Queried ', Format(aCaption, [aQuery]));
@@ -38,7 +53,7 @@ begin
     with TStringList.Create do
     try
       Text := C.LastRawJSON;
-      SaveToFile(Format('rdap_example_%s.json', [aQuery]));
+      SaveToFile(Format('rdap_example_%s.json', [SanitizeFileName(aQuery)]));
     finally
       Free;
     end;

@@ -85,7 +85,8 @@ type
   { TRDAPClient }
 
   { RDAP client for a single base URL or, when no base URL is set, for the IANA bootstrap.
-    Only QueryDomain and QueryIP are bootstrap-aware; entity and autnum queries always need BaseURL. }
+    Only QueryDomain and QueryIP are bootstrap-aware; entity and autnum queries always need BaseURL.
+    Not thread-safe: all queries share the Last* result state, so use one instance per thread. }
 
   TRDAPClient = class
   private
@@ -131,6 +132,9 @@ type
     property IOTimeout: Integer read FIOTimeout write FIOTimeout;
 
     property LastRawJSON: string read FLastRawJSON;
+    { JSON tree of the last response. Owned by the client and invalidated by
+      the next query (freed in ClearLastState): the pointer is only valid until
+      the next Query* call; nil when nothing was parsed. }
     property LastJSON: TJSONData read FLastJSON;
     property LastURL: string read FLastURL;
     property LastHTTPCode: Integer read FLastHTTPCode;
@@ -145,6 +149,9 @@ type
     // The bootstrap is not owned by the client: create and free it yourself.
     property Bootstrap: TRDAPBootstrap read FBootstrap write FBootstrap;
 
+    { Queries the domain object for ADomain, an LDH name that must already be
+      in A-label (punycode) form: RFC 9082 expects ASCII in the URL path, and
+      non-ASCII U-labels are rejected with ERDAPError (no IDNA conversion). }
     function QueryDomain(const ADomain: string): string;
     function QueryIP(const AIP: string): string;
     function QueryAutNum(const AAutNum: string): string;
@@ -191,6 +198,8 @@ implementation
 uses
   StrUtils, fphttpclient, jsonparser, opensslsockets, openssl;
 
+// Single trailing-slash normalization point for base URLs, both the client's
+// BaseURL and the bootstrap URLs: appends the missing '/' before APath.
 function NormalizePath(const ABase, APath: string): string;
 begin
   if (ABase <> '') and (ABase[Length(ABase)] <> '/') then
@@ -275,6 +284,18 @@ begin
     Exit;
   for I := 1 to Length(S) do
     if not (S[I] in ['0'..'9']) then
+      Exit(False);
+end;
+
+// True when every byte of S is ASCII (< $80). Strings are UTF-8 by contract,
+// so any byte >= $80 belongs to a multi-byte character.
+function IsASCII(const S: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  for I := 1 to Length(S) do
+    if Ord(S[I]) >= $80 then
       Exit(False);
 end;
 
@@ -449,6 +470,8 @@ function TryStrToIPv6(const S: string; out aIP: TIPv6Bytes): Boolean;
 
   // Parses one side of "::" (or the whole address without "::") into groups.
   // An embedded IPv4 tail ("::ffff:192.0.2.1") counts as two groups.
+  // Only AGroups[0..ACount-1] are written, so the caller's array needs no
+  // pre-initialization; on failure the caller exits without reading it.
   function ParseSide(AParts: TStrings; var AGroups: array of Word;
     out ACount: Integer): Boolean;
   var
@@ -484,6 +507,9 @@ function TryStrToIPv6(const S: string; out aIP: TIPv6Bytes): Boolean;
     Result := True;
   end;
 
+const
+  ZeroIPv6: TIPv6Bytes = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  ZeroGroups: array[0..7] of Word = (0, 0, 0, 0, 0, 0, 0, 0);
 var
   DoubleColonPos: Integer;
   LeftParts, RightParts: TStringList;
@@ -491,8 +517,12 @@ var
   LeftCount, RightCount, I: Integer;
 begin
   Result := False;
-  // Initialize на статическом массиве - no-op: байты остаются мусорными
-  FillChar(aIP, SizeOf(aIP), 0);
+  // Zeroed via real assignments: the flow analyzer does not recognize FillChar
+  // as initialization (it would hint "not initialized" at the out parameter
+  // and at the open-array var parameters of ParseSide otherwise).
+  aIP := ZeroIPv6;
+  LeftGroups := ZeroGroups;
+  RightGroups := ZeroGroups;
   if (S = '') or (Pos(':', S) = 0) then
     Exit;
 
@@ -509,10 +539,8 @@ begin
       SplitByChar(Copy(S, DoubleColonPos + 2, MaxInt), ':', RightParts);
       DropSingleBlank(LeftParts);
       DropSingleBlank(RightParts);
-      FillChar(LeftGroups, SizeOf(LeftGroups), 0);
       if not ParseSide(LeftParts, LeftGroups, LeftCount) then
         Exit;
-      FillChar(RightGroups, SizeOf(RightGroups), 0);
       if not ParseSide(RightParts, RightGroups, RightCount) then
         Exit;
       if LeftCount + RightCount > 7 then
@@ -1094,10 +1122,9 @@ end;
 constructor TRDAPClient.Create(const ABaseURL: string);
 begin
   inherited Create;
-  if ABaseURL <> '' then
-    FBaseURL := ABaseURL;
-  if (FBaseURL <> '') and (FBaseURL[Length(FBaseURL)] <> '/') then
-    FBaseURL := FBaseURL + '/';
+  // BaseURL is stored as given; the trailing '/' is appended by NormalizePath
+  // at query time (which also normalizes bootstrap URLs) - one place by design.
+  FBaseURL := ABaseURL;
   FUserAgent := 'fp-rdap-client/1.0';
   FConnectTimeout := 15000;
   FIOTimeout := 30000;
@@ -1144,16 +1171,24 @@ end;
 function TRDAPClient.QueryDomain(const ADomain: string): string;
 var
   Base: string;
+  Domain: string;
 begin
-  if Trim(ADomain) = '' then
+  Domain := Trim(ADomain);
+  if Domain = '' then
     raise ERDAPError.Create('Domain is empty');
+  // RFC 9082 puts the LDH name in the URL path as an A-label (punycode); a
+  // U-label would become percent-encoded UTF-8, which RDAP servers do not
+  // resolve, so it is rejected instead of sent (no IDNA conversion here).
+  if not IsASCII(Domain) then
+    raise ERDAPError.CreateFmt(
+      'Domain must be an ASCII A-label (punycode), not a U-label: %s', [Domain]);
   if FBaseURL <> '' then
     Base := FBaseURL
   else if Assigned(FBootstrap) then
-    Base := FBootstrap.GetBaseURLForDomain(ADomain)
+    Base := FBootstrap.GetBaseURLForDomain(Domain)
   else
     raise ERDAPError.Create('No base URL and no bootstrap configured');
-  Result := ExecuteQuery('domain/' + EncodePathSegment(Trim(ADomain)), Base);
+  Result := ExecuteQuery('domain/' + EncodePathSegment(Domain), Base);
 end;
 
 function TRDAPClient.QueryIP(const AIP: string): string;

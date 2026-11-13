@@ -122,12 +122,14 @@ type
     function NewDNSBootstrap: TRDAPBootstrap;
   published
     procedure TestConstructor;
+    procedure TestConstructor_BaseURLStoredAsIs;
     procedure TestQueryDomain_Mock;
     procedure TestQueryDomain_BaseURLNormalized;
     procedure TestQueryDomain_BaseURLOverridesBootstrap;
     procedure TestQueryDomain_UsesBootstrapBaseURL;
     procedure TestQueryDomain_NoBaseNoBootstrap;
     procedure TestQueryDomain_EmptyDomain;
+    procedure TestQueryDomain_RejectsULabel;
     procedure TestQueryDomain_EncodesPath;
     procedure TestQueryIP_Mock;
     procedure TestQueryIP_IPv6;
@@ -320,7 +322,7 @@ begin
   AssertFalse('2001:db8::1 in 2001:db9::/32', IPv6InNetwork(IP, Net, 32));
 
   AssertTrue('parse net 3', TryStrToIPv6('2620:0:2d0::', Net));
-  AssertTrue('/48 match', IPv6InNetwork(IP, Net, 48) = False);
+  AssertFalse('/48 no match', IPv6InNetwork(IP, Net, 48));
 
   AssertTrue('parse net 4', TryStrToIPv6('2a00::', Net));
   AssertTrue('parse IP 2', TryStrToIPv6('2a01:4f8::1', IP));
@@ -889,6 +891,24 @@ begin
   AssertEquals('no requests yet', 0, FClient.MockRequestCount);
 end;
 
+// BaseURL is stored as given: the trailing '/' is appended by NormalizePath
+// at query time, the property keeps the constructor value verbatim.
+procedure TTestRDAPClient.TestConstructor_BaseURLStoredAsIs;
+var
+  C: TRDAPClientMock;
+begin
+  C := TRDAPClientMock.Create('https://rdap.example.org');
+  try
+    AssertEquals('stored as given', 'https://rdap.example.org', C.BaseURL);
+    C.SetupMock(FMockJSON);
+    C.QueryDomain('example.com');
+    AssertEquals('query URL still normalized',
+      'https://rdap.example.org/domain/example.com', C.LastURL);
+  finally
+    C.Free;
+  end;
+end;
+
 procedure TTestRDAPClient.TestQueryDomain_Mock;
 begin
   FClient.BaseURL := 'https://rdap.example.org';
@@ -982,6 +1002,43 @@ begin
       Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
   end;
   AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('no request performed', 0, FClient.MockRequestCount);
+end;
+
+// RFC 9082 expects A-labels (punycode) in the URL path; a U-label would be
+// sent as percent-encoded UTF-8 that RDAP servers do not resolve. Raw byte
+// escapes keep the test independent of the system codepage (stage 1 notes).
+procedure TTestRDAPClient.TestQueryDomain_RejectsULabel;
+const
+  ULabel = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80 + '.' +
+    #$D1#$80#$D1#$84; // "пример.рф" as raw UTF-8 bytes
+var
+  Raised: Boolean;
+
+  procedure ExpectRejected(const ADomain: string);
+  begin
+    Raised := False;
+    try
+      FClient.QueryDomain(ADomain);
+    except
+      on E: ERDAPError do
+      begin
+        Raised := True;
+        AssertTrue('message mentions ASCII', Pos('ASCII', E.Message) > 0);
+      end;
+      on E: Exception do
+        Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+    end;
+    AssertTrue('ERDAPError expected', Raised);
+  end;
+
+begin
+  FClient.BaseURL := 'https://rdap.example.org';
+  FClient.SetupMock(FMockJSON);
+
+  ExpectRejected(ULabel);
+  // A mixed LDH + U-label name is rejected as well.
+  ExpectRejected('example.' + #$D1#$80#$D1#$84);
   AssertEquals('no request performed', 0, FClient.MockRequestCount);
 end;
 
