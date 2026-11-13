@@ -151,6 +151,7 @@ type
     procedure TestRetryAfter_HTTPDate;
     procedure TestRetryAfter_AbsentAndNotCarriedOver;
     procedure TestErrorTitle_UTF8;
+    procedure TestParseBoundary_NonUtf8DefaultCodepage;
     procedure TestUnexpectedStatus_Raises;
     procedure TestNetworkError_Wrapped;
     procedure TestMalformed200JSON;
@@ -1341,6 +1342,57 @@ begin
   AssertEquals('errorCode extracted', 200, FClient.LastErrorCode);
   AssertEquals('title keeps UTF-8 bytes', Expected, FClient.LastErrorTitle);
   AssertTrue('no question marks', Pos('?', FClient.LastErrorTitle) = 0);
+end;
+
+// The parse boundary must not depend on the process default codepage: this
+// payload reaches ParseJSONSafe with a cp1251 codepage label, as it would on a
+// Windows host with a non-UTF-8 ANSI codepage (or under FPC 3.3+ once the
+// global DefaultSystemCodePage := CP_UTF8 init is re-evaluated). Utf8JSONArg
+// relabels the body to CP_UTF8 without conversion, so the parse keeps the
+// bytes byte-exact. The extracted title then crosses the AsString -> String
+// boundary, which converts into the current default codepage - hence the
+// cp1251 expectation below, pinned via a hex dump so that no codepage
+// conversion can touch the expected bytes either.
+procedure TTestRDAPClient.TestParseBoundary_NonUtf8DefaultCodepage;
+const
+  TestUtf8: packed array[0..7] of Byte = ($D1, $82, $D0, $B5, $D1, $81, $D1, $82);
+    // "тест" as raw UTF-8 bytes, built via SetString so the string keeps these
+    // bytes under any default codepage
+  ExpectedHex = 'EF F0 E8 E2 E5 F2 20 F2 E5 F1 F2'; // "привет тест" in cp1251
+var
+  RawPart, Body: string;
+  SavedCP: TSystemCodePage;
+
+  function HexBytes(const S: RawByteString): string;
+  var
+    I: Integer;
+  begin
+    Result := '';
+    for I := 1 to Length(S) do
+    begin
+      if I > 1 then
+        Result := Result + ' ';
+      Result := Result + IntToHex(Ord(S[I]), 2);
+    end;
+  end;
+
+begin
+  SavedCP := DefaultSystemCodePage;
+  DefaultSystemCodePage := TSystemCodePage(1251);
+  try
+    SetString(RawPart, PAnsiChar(@TestUtf8[0]), Length(TestUtf8));
+    FClient.BaseURL := 'https://rdap.example.org';
+    Body := '{"errorCode":200,"title":"\u043f\u0440\u0438\u0432\u0435\u0442 '
+      + RawPart + '"}';
+    FClient.SetupMock(Body, 200);
+    FClient.QueryDomain('example.com');
+    AssertTrue('status OK', FClient.LastStatus = rqsOK);
+    AssertEquals('errorCode extracted', 200, FClient.LastErrorCode);
+    AssertEquals('title parsed from cp1251-labeled body', ExpectedHex,
+      HexBytes(FClient.LastErrorTitle));
+  finally
+    DefaultSystemCodePage := SavedCP;
+  end;
 end;
 
 // 500 is outside the accepted code list: through the mock it reaches the

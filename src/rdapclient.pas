@@ -208,13 +208,27 @@ begin
     Result := ABase + APath;
 end;
 
+// GetJSON takes a TJSONStringType (= UTF8String) parameter, so an argument
+// carrying a non-UTF-8 codepage label gets byte-converted before fcl-json sees
+// it. RDAP payloads are UTF-8 bytes by contract, so hand over a private copy
+// relabeled CP_UTF8 without conversion: the bytes reach the scanner unchanged
+// even when DefaultSystemCodePage is not UTF-8 (a no-op relabel when it is).
+// Verified on 3.2.2 with a simulated cp1251 default codepage: without the
+// relabel the literal non-ASCII bytes are double-encoded at the call boundary,
+// with it the parse keeps them byte-exact.
+function Utf8JSONArg(const AJSON: string): string;
+begin
+  SetString(Result, PChar(Pointer(AJSON)), Length(AJSON));
+  SetCodePage(RawByteString(Result), CP_UTF8, False);
+end;
+
 procedure ParseJSONSafe(const AJSON: string; out AData: TJSONData);
 begin
   AData := nil;
   if AJSON = '' then
     Exit;
   try
-    AData := GetJSON(AJSON, True);
+    AData := GetJSON(Utf8JSONArg(AJSON), True);
   except
     on E: Exception do
       raise ERDAPError.CreateFmt('JSON parse error: %s', [E.Message]);
@@ -228,7 +242,7 @@ begin
   if AJSON = '' then
     Exit;
   try
-    AData := GetJSON(AJSON, True);
+    AData := GetJSON(Utf8JSONArg(AJSON), True);
   except
     AData := nil;
   end;
@@ -1344,11 +1358,20 @@ end;
 initialization
   // RDAP payloads and bootstrap files are guaranteed UTF-8 (RFC 9083/9224/9225),
   // and all strings of this library are UTF-8 by contract. On Windows with a
-  // non-UTF-8 ANSI codepage fcl-json 3.2.2 mangles \uXXXX escapes (it decodes
-  // them to the ANSI codepage and then re-decodes the result as UTF-8) and
-  // distorts literal non-ASCII bytes (the system-codepage conversion at the
-  // GetJSON call boundary). Making the default Ansistring codepage UTF-8 turns
-  // every such conversion into an identity, so parsed strings keep their bytes.
+  // non-UTF-8 ANSI codepage fcl-json 3.2.2 mangles such data: literal non-ASCII
+  // bytes are converted at the GetJSON(string -> UTF8String) call boundary with
+  // any UseUTF8 value, and with UseUTF8=False the \uXXXX escapes additionally
+  // end up in the system codepage without a re-encode. Making the default
+  // AnsiString codepage UTF-8 turns every such conversion into an identity, so
+  // strings keep their bytes on input and on output (TJSONData.AsString ->
+  // String assignments too). The parse inputs are additionally relabeled by
+  // Utf8JSONArg, so parsing itself is codepage-independent; this setting still
+  // guards the value-extraction (ExtractRDAPError and similar) and the
+  // bootstrap-loading boundaries. fcl-json parses label-independently since
+  // FPC 3.3.1 (the scanner emits UTF-8 and labels tokens CP_UTF8; verified
+  // against sources 2026-11-14), but the AsString -> String conversions do not:
+  // dropping this assignment requires making every string boundary
+  // codepage-explicit first.
   // NOTE: this affects the whole process using this unit, not just the library.
   DefaultSystemCodePage := CP_UTF8;
 
