@@ -28,10 +28,13 @@ function IPv6InNetwork(const aIP, aNetworkIP: TIPv6Bytes; aPrefixLen: Integer): 
 function DomainMatchesKey(const aDomain, aKey: string): Integer;
 { Converts a UTF-8 domain name to the A-label form expected by RFC 9082: every
   non-ASCII label is punycode-encoded (RFC 3492, via the fp-idn package) and
-  prefixed with "xn--", ASCII labels (including already converted A-labels)
-  pass through unchanged. Punycode only - no IDNA nameprep/UTS-46 normalization
-  or case folding: an uppercase U-label encodes to an A-label other than the
-  registered (lowercase) form, so pass names in lowercase NFC. }
+  prefixed with "xn--". Besides punycode the fp-idn IDNA mapping applies:
+  ASCII/Cyrillic/Greek uppercase folds to lowercase, the label separators
+  U+FF0E/U+3002/U+FF61 map to '.', and already converted A-labels pass
+  through unchanged. Raises ERDAPError for domains fp-idn rejects (malformed
+  UTF-8, control characters or space in a label, forbidden ASCII <>"/\?#@:|,
+  DNS length limits); empty input yields an empty result. No NFC
+  normalization: pass names in NFC form. }
 function DomainToASCII(const ADomain: string): string;
 { Percent-encodes a string so it is safe to embed as a single URL path segment. }
 function EncodePathSegment(const S: string): string;
@@ -170,7 +173,8 @@ type
 
     { Queries the domain object for ADomain. Non-ASCII U-labels are converted
       to A-label (punycode) form before the bootstrap lookup and the request;
-      see DomainToASCII for the conversion limits. }
+      domains rejected by IDNA validation raise ERDAPError - see DomainToASCII
+      for the conversion limits. }
     function QueryDomain(const ADomain: string): string;
     function QueryIP(const AIP: string): string;
     function QueryAutNum(const AAutNum: string): string;
@@ -320,12 +324,15 @@ begin
       Exit(False);
 end;
 
-// U-label to A-label conversion, one label at a time (RFC 3492 punycode,
-// fp-idn package): see the interface comment for the exact contract. Pure
-// ASCII input comes back unchanged, so LDH names are unaffected.
+// U-label to A-label conversion (RFC 3492 punycode + the fp-idn IDNA
+// mapping): see the interface comment for the exact contract. TryUnicodeToIDN
+// instead of the plain wrapper so a domain rejected by the fp-idn validation
+// (space, forbidden ASCII, length limits) raises instead of silently turning
+// into an empty URL path (fp-idn 1.1.0.0 semantics).
 function DomainToASCII(const ADomain: string): string;
 begin
-  Result := UnicodeToIDN(ADomain);
+  if not TryUnicodeToIDN(ADomain, Result) then
+    raise ERDAPError.CreateFmt('Domain rejected by IDNA validation: %s', [ADomain]);
 end;
 
 // Parses an IMF-fixdate HTTP-date (RFC 7231 §7.1.1.1), e.g.

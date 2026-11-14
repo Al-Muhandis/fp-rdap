@@ -137,7 +137,7 @@ type
     procedure TestQueryDomain_ULabelToALabel;
     procedure TestQueryDomain_ALabelPassThrough;
     procedure TestQueryDomain_BootstrapWithULabel;
-    procedure TestQueryDomain_EncodesPath;
+    procedure TestQueryDomain_RejectsInvalidDomain;
     procedure TestQueryIP_Mock;
     procedure TestQueryIP_IPv6;
     procedure TestQueryIP_InvalidIP;
@@ -350,26 +350,52 @@ begin
   AssertEquals('longer domain than key', 1, DomainMatchesKey('example.com', 'com'));
 end;
 
-// U-label -> A-label conversion (RFC 3492 punycode, fp-idn package). Raw byte
-// escapes keep the test independent of the system codepage (stage 1 notes);
-// the expected A-labels are the well-known punycode forms of these names.
+// U-label -> A-label conversion (RFC 3492 punycode + fp-idn IDNA mapping).
+// Raw byte escapes keep the test independent of the system codepage (stage 1
+// notes); the expected A-labels are the well-known punycode forms of these
+// names, probed against fp-idn 1.1.0.0.
 procedure TTestIPUtils.TestDomainToASCII;
 const
   Prm = #$D0#$BF#$D1#$80#$D0#$B8#$D0#$BC#$D0#$B5#$D1#$80; // "пример"
   ULabelRF = Prm + '.' + #$D1#$80#$D1#$84;                // "пример.рф"
+  ULabelRFUpper = #$D0#$9F#$D0#$A0#$D0#$98#$D0#$9C#$D0#$95#$D0#$A0 + '.' +
+    #$D0#$A0#$D0#$A4;                                     // "ПРИМЕР.РФ"
   BUCHER = 'b' + #$C3#$BC + 'cher';                       // "bücher"
+var
+  Raised: Boolean;
 begin
-  // LDH and already-converted names pass through byte-identical (no folding).
+  // Lowercase LDH and already-converted names pass through byte-identical.
   AssertEquals('ASCII passthrough', 'example.com', DomainToASCII('example.com'));
-  AssertEquals('ASCII case kept', 'Example.COM', DomainToASCII('Example.COM'));
   AssertEquals('A-label passthrough', 'xn--e1afmkfd.xn--p1ai',
     DomainToASCII('xn--e1afmkfd.xn--p1ai'));
   AssertEquals('empty', '', DomainToASCII(''));
+  // fp-idn 1.1.0.0 folds ASCII/Cyrillic/Greek uppercase to lowercase, so
+  // uppercase names reach the registered (lowercase) A-label.
+  AssertEquals('ASCII uppercase folds to lowercase', 'example.com',
+    DomainToASCII('Example.COM'));
+  AssertEquals('uppercase U-label folds to registered A-label',
+    'xn--e1afmkfd.xn--p1ai', DomainToASCII(ULabelRFUpper));
   // Each non-ASCII label becomes "xn--" + punycode.
   AssertEquals('full U-label name', 'xn--e1afmkfd.xn--p1ai', DomainToASCII(ULabelRF));
   AssertEquals('mixed LDH + U-label', 'xn--e1afmkfd.com', DomainToASCII(Prm + '.com'));
   AssertEquals('RFC 3492 vector', 'xn--bcher-kva.example',
     DomainToASCII(BUCHER + '.example'));
+  // fp-idn validation rejects forbidden label characters (space, control
+  // bytes); DomainToASCII raises instead of the plain wrapper's silent empty
+  // result.
+  Raised := False;
+  try
+    DomainToASCII('two words.example');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions the domain', Pos('two words.example', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected for a domain with a space', Raised);
 end;
 
 procedure TTestIPUtils.TestEncodePathSegment;
@@ -1095,13 +1121,30 @@ begin
   end;
 end;
 
-procedure TTestRDAPClient.TestQueryDomain_EncodesPath;
+// fp-idn 1.1.0.0 rejects forbidden label characters (here: a space) and
+// DomainToASCII surfaces that as ERDAPError, so the query never reaches the
+// network. Before fp-idn gained label validation this domain was silently
+// percent-encoded into the URL path ("two%20words.example").
+procedure TTestRDAPClient.TestQueryDomain_RejectsInvalidDomain;
+var
+  Raised: Boolean;
 begin
   FClient.BaseURL := 'https://rdap.example.org';
   FClient.SetupMock(FMockJSON);
-  FClient.QueryDomain('two words.example');
-  AssertTrue('space percent-encoded in ' + FClient.LastURL,
-    Pos('two%20words.example', FClient.LastURL) > 0);
+  Raised := False;
+  try
+    FClient.QueryDomain('two words.example');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions the domain', Pos('two words.example', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertEquals('no request URL built', '', FClient.LastURL);
 end;
 
 procedure TTestRDAPClient.TestQueryIP_Mock;
