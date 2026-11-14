@@ -37,6 +37,9 @@ lib/
 
 # Some additional markup files (bootstrap snapshots are not committed)
 *.json
+# ...except the OPM manifests (initial listing and external update)
+!FpRdap.json
+!update_FpRdap.json
 
 # ZCode agent workspace (roadmap etc., local only)
 .zcode/
