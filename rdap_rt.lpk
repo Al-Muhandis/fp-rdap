@@ -4,7 +4,7 @@
     <PathDelim Value="\"/>
     <Name Value="rdap_rt"/>
     <Type Value="RunTimeOnly"/>
-    <Author Value="Renat Suleymanov mail@Renat.Su"/>
+    <Author Value="Renat Suleymanov (al-muhandis)"/>
     <CompilerOptions>
       <Version Value="11"/>
       <PathDelim Value="\"/>
@@ -13,9 +13,9 @@
         <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
       </SearchPaths>
     </CompilerOptions>
-    <Description Value="RDAP client lib"/>
+    <Description Value="RDAP client library for Free Pascal: domain/IP/autnum/entity queries (RFC 9082/9083) routed via official IANA bootstrap files (RFC 8524/9224/9225), with IDNA punycode conversion of U-label domains (via fp-idn), RFC 9083 error-object parsing, Retry-After handling, response size limits, and a built-in mock client for offline unit tests."/>
     <License Value="MIT"/>
-    <Version Release="1"/>
+    <Version Major="1" Minor="0"/>
     <Files>
       <Item>
         <Filename Value="src\rdapclient.pas"/>
@@ -25,6 +25,7 @@
     <RequiredPkgs>
       <Item>
         <PackageName Value="fpidn_rt"/>
+        <MinVersion Major="1" Minor="1" Valid="True"/>
       </Item>
       <Item>
         <PackageName Value="FCL"/>
