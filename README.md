@@ -17,6 +17,10 @@ RDAP ([RFC 9082]/[RFC 9083]) с роутингом через официальн
   RDAP error-объекта (`errorCode`/`title`) и заголовка `Retry-After`.
 - Таймауты соединения/IO, User-Agent, редиректы, лимит размера ответа
   (`MaxResponseSize`, по умолчанию 10 МБ, 0 — без ограничения).
+- SOCKS5-прокси: `ProxyHost`/`ProxyPort`/`ProxyUser`/`ProxyPass` — при непустом
+  `ProxyHost` запросы идут через прокси (транспорт переключается на Synapse
+  `THTTPSend`, TLS — через OpenSSL-плагин Synapse); при пустом — прежнее
+  поведение 1-в-1 (паритет с fp-whois `TWhoisClient`).
 - Встроенный мок (`TRDAPClientMock`) для тестов без сети.
 
 ## Структура
@@ -32,7 +36,8 @@ RDAP ([RFC 9082]/[RFC 9083]) с роутингом через официальн
 
 Установите пакет `rdap_rt.lpk` в Lazarus (Package → Open → Install) или просто добавьте
 `src/rdapclient.pas` в проект. Требуется FPC 3.2+, FCL (fpjson, fphttpclient), пакет
-[`fpidn_rt`](https://github.com/al-muhandis/fp-idn) (fp-idn, punycode для IDNA-конвертации)
+[`fpidn_rt`](https://github.com/al-muhandis/fp-idn) (fp-idn, punycode для IDNA-конвертации),
+пакет Synapse (`laz_synapse` — транспорт SOCKS5-прокси)
 и OpenSSL библиотеки в PATH для HTTPS.
 
 ## Быстрый старт
@@ -78,7 +83,7 @@ end;
 ## Тесты
 
 ```bash
-C:\lazarus\lazbuild.exe tests\rdap_tests.lpi
+C:\laz-4.8\lazarus\lazbuild.exe --pcp=C:\laz-4.8\config_lazarus tests\rdap_tests.lpi
 tests\rdap_tests.exe --all --format=plain
 ```
 
@@ -94,6 +99,14 @@ tests\rdap_tests.exe --all --format=plain
 объектов, error-сообщения, JSON-превью) печатаются без mojibake; нужен шрифт
 консоли с поддержкой Unicode (в современных Windows он по умолчанию).
 
+Ручная проверка SOCKS5-транспорта с живым прокси:
+
+```bash
+rdap_demo --proxy=127.0.0.1:1080 --proxy-user=u --proxy-pass=p
+```
+
+Без `--proxy` демо ходит напрямую, как и раньше.
+
 ## Ограничения
 
 - Клиент не потокобезопасен: один экземпляр на поток.
@@ -105,6 +118,18 @@ tests\rdap_tests.exe --all --format=plain
   формы одного имени кодируются в разные A-label — передавайте имена в NFC.
 - Ответ больше `MaxResponseSize` (по умолчанию 10 МБ) обрывается с `ERDAPError`;
   0 отключает лимит.
+- SOCKS5-прокси-режим (при непустом `ProxyHost`) отличается от прямой дороги:
+  - только SOCKS5 (`SocksType` — дефолт Synapse); SOCKS4 не поддерживается;
+    no-auth при пустом `ProxyUser`, user/pass при заданном;
+  - `MaxResponseSize` применяется **после** полной загрузки тела: обрыва
+    скачивания mid-read, как на прямой дороге, нет — тело сверх лимита
+    скачивается целиком и только потом отвергается;
+  - редиректы обрабатываются вручную: до 5 переходов, только абсолютные
+    `Location` (http/https); относительный `Location` даёт `ERDAPError`;
+  - TLS поверх туннеля SOCKS5 прозрачен, но для HTTPS-целей нужны
+    OpenSSL-библиотеки — как и на прямой дороге;
+  - сетевой TLS-over-SOCKS юнит-тестами не покрывается (loopback-стаб не
+    говорит TLS; туннель прозрачен, доверяем плагину Synapse).
 
 ## Лицензия
 
@@ -113,6 +138,38 @@ MIT — см. [LICENSE](LICENSE).
 ## Изменения
 
 Журнал релизов — в [CHANGELOG.md](CHANGELOG.md).
+
+### 2026-11-15 — SOCKS5-прокси в транспорте (этап 6 дорожной карты)
+
+- Новое: свойства `ProxyHost`/`ProxyPort`/`ProxyUser`/`ProxyPass` (паритет с
+  fp-whois `TWhoisClient`; `ProxyPort` без скрытого дефолта). При непустом
+  `ProxyHost` запросы идут через SOCKS5-прокси; при пустом — поведение не
+  изменилось ни в чём (все прежние тесты зелёные без правок).
+- Транспорт прокси-режима — Synapse `THTTPSend`; новая зависимость
+  `rdap_rt.lpk` — `laz_synapse`. no-auth при пустом `ProxyUser`, user/pass
+  при заданном (проверено по исходникам Synapse 40.1: `SocksOpen` выбирает
+  SOCKS5 всегда при дефолтном `SocksType`, опасение дорожной карты о SOCKS4
+  на эту версию не распространяется). `ConnectTimeout`/`IOTimeout`
+  применяются и здесь; TLS поверх туннеля — через `ssl_openssl`-плагин.
+- Редиректы в прокси-режиме — ручной цикл до 5 переходов (паритет
+  `AllowRedirect`/`MaxRedirects=5` прямой дороги), только абсолютные
+  `Location`; относительный — `ERDAPError`.
+- `MaxResponseSize` в прокси-режиме применяется после полной загрузки тела
+  (обрыв mid-read, как на прямой дороге, невозможен) — расхождение
+  задокументировано в «Ограничениях».
+- `Retry-After`, заголовки ответа и error-объекты работают на обеих дорогах
+  одинаково (снапшот заголовков нормализуется к разделителю `:` — у Synapse
+  он был `=`, что ломало бы поиск заголовков).
+- Тесты: loopback SOCKS5-стаб (`TThread` + слушающий сокет, без сети и DNS):
+  8 новых тестов — 200/429+`Retry-After`/отказ CONNECT/302-редирект/
+  относительный `Location`/user-pass/дефолты свойств; всего 80 тестов.
+- Демо: CLI-параметры `--proxy=host:port`, `--proxy-user=`, `--proxy-pass=`
+  для ручной проверки с живым прокси.
+- Сборка: команды AGENTS.md/README переключены на инсталляцию
+  `C:\laz-4.8` (`--pcp=C:\laz-4.8\config_lazarus`) — прежний `C:\lazarus`
+  неработоспособен, а его конфиг ссылался на несуществующий путь `laz_synapse`.
+- Релизные шаги (версия lpk, `FpRdap.json` DependenciesAsString, запись
+  CHANGELOG, тег/CI) — при публикации, как договорились в дорожной карте.
 
 ### 2026-11-14 — Адаптация к fp-idn 1.1.0.0: IDNA-валидация и приведение регистра
 
