@@ -79,6 +79,38 @@ begin
   PrintResult(C, aQuery, aCaption);
 end;
 
+// Applies the proxy command line to the client: --proxy=host:port (mandatory
+// host, optional port), --proxy-user=u, --proxy-pass=p. Manual live-SOCKS
+// verification of the proxy transport; without --proxy the demo runs direct.
+procedure ApplyProxyFromCommandLine(C: TRDAPClient);
+var
+  I, P: Integer;
+  S: string;
+begin
+  for I := 1 to ParamCount do
+  begin
+    S := ParamStr(I);
+    if Pos('--proxy=', S) = 1 then
+    begin
+      S := Copy(S, 9, MaxInt);
+      P := Pos(':', S);
+      if P > 0 then
+      begin
+        C.ProxyHost := Copy(S, 1, P - 1);
+        C.ProxyPort := StrToIntDef(Copy(S, P + 1, MaxInt), 0);
+      end
+      else
+        C.ProxyHost := S;
+    end
+    else if Pos('--proxy-user=', S) = 1 then
+      C.ProxyUser := Copy(S, 14, MaxInt)
+    else if Pos('--proxy-pass=', S) = 1 then
+      C.ProxyPass := Copy(S, 14, MaxInt);
+  end;
+  if C.ProxyHost <> '' then
+    Writeln('Using SOCKS5 proxy: ', C.ProxyHost, ':', C.ProxyPort);
+end;
+
 procedure RunDemos;
 var
   C: TRDAPClient;
@@ -105,6 +137,7 @@ begin
 
     C := TRDAPClient.Create;
     try
+      ApplyProxyFromCommandLine(C);
       if BootstrapOK then
         C.Bootstrap := B
       else
