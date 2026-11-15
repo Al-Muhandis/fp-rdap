@@ -28,6 +28,9 @@
         <MinVersion Major="1" Minor="1" Valid="True"/>
       </Item>
       <Item>
+        <PackageName Value="laz_synapse"/>
+      </Item>
+      <Item>
         <PackageName Value="FCL"/>
       </Item>
     </RequiredPkgs>

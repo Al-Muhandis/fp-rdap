@@ -22,6 +22,9 @@
         <PackageName Value="fpidn_rt"/>
       </Item>
       <Item>
+        <PackageName Value="laz_synapse"/>
+      </Item>
+      <Item>
         <PackageName Value="FCL"/>
       </Item>
     </RequiredPackages>

@@ -105,6 +105,10 @@ type
     FUserAgent: string;
     FConnectTimeout: Integer;
     FIOTimeout: Integer;
+    FProxyHost: string;
+    FProxyPort: Integer;
+    FProxyUser: string;
+    FProxyPass: string;
     FMaxResponseSize: Int64;
     FSSLInitialized: Boolean;
     FLastRawJSON: string;
@@ -133,6 +137,10 @@ type
     // Performs the actual HTTP GET and returns the response body.
     // Override to mock the network layer in tests.
     function DoHTTPGetJSON(const AURL, AUserAgent: string): string; virtual;
+    // SOCKS5-proxy transport behind DoHTTPGetJSON, dispatched to when
+    // ProxyHost <> '' (Synapse THTTPSend). See the implementation comment
+    // for the redirect, size-limit and error-handling contract.
+    function DoHTTPGetJSONViaProxy(const AURL, AUserAgent: string): string; virtual;
     // Raises ERDAPError when ASize exceeds MaxResponseSize (0 = no limit);
     // a body of exactly the limit is accepted. The real download aborts
     // mid-read in TLimitedResponseStream; this check applies the same
@@ -147,6 +155,16 @@ type
     property UserAgent: string read FUserAgent write FUserAgent;
     property ConnectTimeout: Integer read FConnectTimeout write FConnectTimeout;
     property IOTimeout: Integer read FIOTimeout write FIOTimeout;
+    { SOCKS5 proxy settings, mirroring fp-whois TWhoisClient: queries go
+      through the proxy only when ProxyHost <> '' - the whole transport then
+      switches to the SOCKS5-capable HTTP client; with an empty ProxyHost the
+      behavior is exactly as without a proxy. ProxyUser <> '' switches the
+      SOCKS5 user/pass authentication on. ProxyPort has no hidden default:
+      0 is written through as-is, so set it together with ProxyHost. }
+    property ProxyHost: string read FProxyHost write FProxyHost;
+    property ProxyPort: Integer read FProxyPort write FProxyPort;
+    property ProxyUser: string read FProxyUser write FProxyUser;
+    property ProxyPass: string read FProxyPass write FProxyPass;
     { Maximum accepted response body size in bytes (default 10 MB): a larger
       response aborts the download with ERDAPError instead of growing memory
       without bound - protection against broken or hostile servers.
@@ -219,7 +237,8 @@ type
 implementation
 
 uses
-  StrUtils, fpidn, fphttpclient, jsonparser, opensslsockets, openssl;
+  StrUtils, fpidn, fphttpclient, jsonparser, opensslsockets, openssl,
+  httpsend, ssl_openssl;
 
 // Single trailing-slash normalization point for base URLs, both the client's
 // BaseURL and the bootstrap URLs: appends the missing '/' before APath.
@@ -1158,6 +1177,10 @@ var
   SS: TRawByteStringStream;
 begin
   Result := '';
+  // Proxy mode replaces the whole transport (mocked clients override this
+  // method wholesale and never reach the dispatcher).
+  if FProxyHost <> '' then
+    Exit(DoHTTPGetJSONViaProxy(AURL, AUserAgent));
   InitSSLIfNeeded(AURL);
 
   C := TFPHttpClient.Create(nil);
@@ -1192,6 +1215,100 @@ begin
   end;
 end;
 
+// SOCKS5-proxy transport of DoHTTPGetJSON (used only when ProxyHost <> '').
+// The SOCKS5 negotiation happens inside the socket connect (Synapse
+// SocksOpen/SocksRequest: SOCKS5 with the no-auth method when ProxyUser is
+// empty, user/pass otherwise - verified against the Synapse 40.1 sources);
+// TLS to the RDAP server then runs transparently through the established
+// tunnel via the ssl_openssl plugin, which self-registers at unit
+// initialization, so no explicit SSL init is needed here (unlike the direct
+// path). THTTPSend does not follow redirects: they are handled manually, up
+// to 5 hops with absolute Location URLs only (parity with the direct path's
+// AllowRedirect=True/MaxRedirects=5); a relative Location is an ERDAPError
+// (v1 limitation). Unlike the direct path, the body cannot be aborted
+// mid-read here, so MaxResponseSize is enforced after the full download,
+// with the Last* state already captured. Transport errors raise ERDAPError
+// naming the URL and the proxy right where they occur: ExecuteQuery's
+// wrap-up is a backstop, not something to rely on.
+function TRDAPClient.DoHTTPGetJSONViaProxy(const AURL, AUserAgent: string): string;
+const
+  MaxRedirects = 5; // as TFPHttpClient.MaxRedirects on the direct path
+var
+  HTTP: THTTPSend;
+  URL, Location: string;
+  Hop: Integer;
+begin
+  Result := '';
+  URL := AURL;
+  HTTP := THTTPSend.Create;
+  try
+    // The proxy settings map 1-to-1 onto the socket (as fp-whois does); the
+    // proxy is enabled by ProxyHost alone, ProxyPort goes through as-is.
+    // SocksType stays at the Synapse default (ST_Socks5) and SocksResolver
+    // at True: symbolic targets are resolved by the proxy (ATYP=domain), so
+    // no local DNS lookup happens.
+    HTTP.Sock.SocksIP := FProxyHost;
+    HTTP.Sock.SocksPort := IntToStr(FProxyPort);
+    HTTP.Sock.SocksUsername := FProxyUser;
+    HTTP.Sock.SocksPassword := FProxyPass;
+    HTTP.Timeout := FIOTimeout;
+    HTTP.Sock.ConnectionTimeout := FConnectTimeout;
+
+    Hop := 0;
+    while True do
+    begin
+      // Wipe the previous hop's response body and the request headers that
+      // HTTPMethod inserts (User-Agent, Connection, ...), so every pass
+      // starts clean.
+      HTTP.Clear;
+      HTTP.UserAgent := AUserAgent;
+      HTTP.Headers.Add('Accept: application/rdap+json,*/*');
+
+      if not HTTP.HTTPMethod('GET', URL) then
+        raise ERDAPError.CreateFmt('GET %s via SOCKS5 proxy %s:%d failed: %s',
+          [URL, FProxyHost, FProxyPort, HTTP.Sock.LastErrorDesc]);
+
+      // Last* snapshot: every hop overwrites it, so the final response is
+      // what ProcessLastResponse sees.
+      FResponseHeaders.Assign(HTTP.Headers);
+      FLastHTTPCode := HTTP.ResultCode;
+
+      if (HTTP.ResultCode >= 301) and (HTTP.ResultCode <= 308) then
+      begin
+        Location := Trim(HTTP.Headers.Values['Location']);
+        if Location <> '' then
+        begin
+          if Hop >= MaxRedirects then
+            raise ERDAPError.CreateFmt('GET %s: too many redirects (limit %d)',
+              [AURL, MaxRedirects]);
+          // v1: only absolute URLs are followed, like the direct path for
+          // this request shape.
+          if (Pos('http://', LowerCase(Location)) <> 1) and
+             (Pos('https://', LowerCase(Location)) <> 1) then
+            raise ERDAPError.CreateFmt(
+              'Redirect from %s: relative Location is not followed: %s',
+              [URL, Location]);
+          URL := Location;
+          Inc(Hop);
+          Continue;
+        end;
+        // 3xx without a Location header is treated as a final response.
+      end;
+      Break;
+    end;
+
+    // The body was downloaded in full (no mid-read abort like
+    // TLimitedResponseStream on the direct path); enforce the limit before
+    // the body leaves this method - an over-limit response raises with the
+    // LastHTTPCode/headers of that response already in place.
+    CheckResponseLimit(URL, HTTP.Document.Size);
+    if HTTP.Document.Size > 0 then
+      SetString(Result, PChar(HTTP.Document.Memory), HTTP.Document.Size);
+  finally
+    HTTP.Free;
+  end;
+end;
+
 constructor TRDAPClient.Create(const ABaseURL: string);
 begin
   inherited Create;
@@ -1201,6 +1318,9 @@ begin
   FUserAgent := 'fp-rdap-client/1.0';
   FConnectTimeout := 15000;
   FIOTimeout := 30000;
+  // No hidden default proxy port (parity with fp-whois): 0 is written
+  // through as-is until the caller configures the proxy.
+  FProxyPort := 0;
   // 10 MB: real RDAP responses are far smaller; the default limit only guards
   // against broken or hostile servers dumping unbounded data.
   FMaxResponseSize := 10 * 1024 * 1024;
