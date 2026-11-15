@@ -9,15 +9,18 @@
 ## Команды
 
 ```bash
+# Инсталляция Lazarus: C:\laz-4.8 (FPC 3.2.2), конфиг — C:\laz-4.8\config_lazarus
+# (--pcp обязателен: там зарегистрированы fpidn_rt, laz_synapse, rdap_rt).
+
 # Сборка и запуск юнит-тестов (без сети — сетевой слой мокируется)
-C:\lazarus\lazbuild.exe tests\rdap_tests.lpi
+C:\laz-4.8\lazarus\lazbuild.exe --pcp=C:\laz-4.8\config_lazarus tests\rdap_tests.lpi
 tests\rdap_tests.exe --all --format=plain
 
 # Сборка пакета
-C:\lazarus\lazbuild.exe rdap_rt.lpk
+C:\laz-4.8\lazarus\lazbuild.exe --pcp=C:\laz-4.8\config_lazarus rdap_rt.lpk
 
 # Сборка демо (ходит в сеть, требует dns.json/ipv4.json/ipv6.json рядом, ждёт ReadLn)
-C:\lazarus\lazbuild.exe demo\rdap_demo.lpi
+C:\laz-4.8\lazarus\lazbuild.exe --pcp=C:\laz-4.8\config_lazarus demo\rdap_demo.lpi
 ```
 
 ## Конвенции
