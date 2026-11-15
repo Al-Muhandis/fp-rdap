@@ -5,7 +5,7 @@ unit test_rdapclient;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, rdapclient;
+  Classes, SysUtils, SyncObjs, fpcunit, testregistry, rdapclient, blcksock;
 
 const
   // Realistic subsets of the IANA bootstrap files (RFC 8524 / RFC 9224 / RFC 9225).
@@ -163,6 +163,81 @@ type
     procedure TestNetworkError_Wrapped;
     procedure TestMalformed200JSON;
     procedure TestMockRecordsRequests;
+  end;
+
+  { SOCKS5 loopback stub for the proxy-path tests: a thread with a Synapse
+    TTCPBlockSocket listening on 127.0.0.1:<ephemeral port>. No network and
+    no DNS are ever touched - the stub serves each connection with the SOCKS5
+    handshake (no-auth, or RFC 1929 user/pass when AuthUser is set), a CONNECT
+    reply (success, or a configured non-zero failure code) and the next canned
+    raw HTTP response from Responses (the last one repeats), independently of
+    the CONNECT target. 'Connection: close' in the canned responses makes the
+    client reconnect per pass, so the redirect test can count connections. }
+
+  TSOCKS5Stub = class;
+
+  TSOCKS5StubThread = class(TThread)
+  private
+    FStub: TSOCKS5Stub;
+  protected
+    procedure Execute; override;
+    // Full SOCKS5 dialogue of one accepted client connection.
+    procedure ServeClient(ASock: TTCPBlockSocket);
+  public
+    constructor Create(AStub: TSOCKS5Stub);
+  end;
+
+  TSOCKS5Stub = class
+  private
+    FThread: TSOCKS5StubThread;
+    FReady: TEvent;         // signaled when the port is bound
+    FPort: Word;
+    FResponses: TStringList; // canned raw HTTP responses, last repeats
+    FAuthUser: string;       // AuthUser <> '' = user/pass required
+    FAuthPass: string;
+    FAuthSeenUser: string;   // credentials presented by the last handshake
+    FAuthSeenPass: string;
+    FConnectReply: Byte;     // CONNECT REP code, 0 = success
+    FConnections: Integer;  // accepted connections
+    FServed: Integer;        // canned responses handed out
+    FLastTarget: string;     // "host:port" requested by the last CONNECT
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Responses: TStringList read FResponses;
+    property AuthUser: string read FAuthUser write FAuthUser;
+    property AuthPass: string read FAuthPass write FAuthPass;
+    property AuthSeenUser: string read FAuthSeenUser;
+    property AuthSeenPass: string read FAuthSeenPass;
+    property ConnectReply: Byte read FConnectReply write FConnectReply;
+    property Port: Word read FPort;
+    property Connections: Integer read FConnections;
+    property LastTarget: string read FLastTarget;
+  end;
+
+  { TTestProxyClient - the SOCKS5-proxy transport (Synapse path) against the
+    loopback stub: both the proxy and the request targets are loopback names,
+    so no DNS and no external network are involved. }
+
+  TTestProxyClient = class(TRDAPTestCase)
+  private
+    FStub: TSOCKS5Stub;
+    FClient: TRDAPClient;
+    function HTTPResponse(ACode: Integer; const AReason, ABody: string;
+      const AExtra: array of string): string;
+    procedure ConfigureProxy;
+  protected
+    procedure SetUp; override;
+    procedure TearDown; override;
+  published
+    procedure TestProxyDefaults;
+    procedure TestProxy_200JSON;
+    procedure TestProxy_429RetryAfter;
+    procedure TestProxy_ConnectRefused;
+    procedure TestProxy_Redirect302;
+    procedure TestProxy_RedirectRelativeLocation_Raises;
+    procedure TestProxy_UserPassAuth;
+    procedure TestProxy_AuthRejected;
   end;
 
 implementation
@@ -1657,9 +1732,382 @@ begin
     FClient.MockRequestURL(1));
 end;
 
+{ TSOCKS5Stub }
+
+const
+  StubHandshakeTimeoutMs = 3000;
+  StubAcceptPollMs = 50;
+
+constructor TSOCKS5Stub.Create;
+begin
+  inherited Create;
+  FResponses := TStringList.Create;
+  FConnectReply := 0;
+  FReady := TEvent.Create(nil, False, False, '');
+  // The thread binds the port and signals FReady; the constructor waits, so
+  // Port is valid as soon as Create returns.
+  FThread := TSOCKS5StubThread.Create(Self);
+  if FReady.WaitFor(5000) <> wrSignaled then
+    raise Exception.Create('SOCKS5 stub failed to bind its port');
+end;
+
+destructor TSOCKS5Stub.Destroy;
+begin
+  FThread.Terminate;
+  FThread.WaitFor;
+  FThread.Free;
+  FReady.Free;
+  FResponses.Free;
+  inherited Destroy;
+end;
+
+constructor TSOCKS5StubThread.Create(AStub: TSOCKS5Stub);
+begin
+  FStub := AStub;
+  inherited Create(False);
+end;
+
+procedure TSOCKS5StubThread.Execute;
+var
+  LS: TTCPBlockSocket;
+  CS: TTCPBlockSocket;
+begin
+  LS := TTCPBlockSocket.Create;
+  try
+    LS.Bind('127.0.0.1', '0'); // ephemeral port, loopback only
+    LS.Listen;
+    FStub.FPort := Word(LS.GetLocalSinPort);
+    FStub.FReady.SetEvent;
+    // One client at a time: the canned 'Connection: close' responses make the
+    // client reconnect per pass, so a sequential accept loop is enough.
+    while not Terminated do
+      if LS.CanRead(StubAcceptPollMs) then
+      begin
+        CS := TTCPBlockSocket.Create;
+        try
+          CS.Socket := LS.Accept;
+          ServeClient(CS);
+        finally
+          CS.Free;
+        end;
+      end;
+  finally
+    LS.Free;
+  end;
+end;
+
+procedure TSOCKS5StubThread.ServeClient(ASock: TTCPBlockSocket);
+var
+  Buf: AnsiString;
+  NMethods, I, Method, ULen, PLen, AddrLen: Integer;
+  Offered: Boolean;
+  ATyp: Byte;
+  PortWord: Word;
+begin
+  // 1) Greeting: VER, NMETHODS, METHODS.
+  Buf := ASock.RecvBufferStr(2, StubHandshakeTimeoutMs);
+  if (ASock.LastError <> 0) or (Length(Buf) < 2) or (Buf[1] <> #5) then
+    Exit;
+  NMethods := Ord(Buf[2]);
+  if NMethods = 0 then
+    Exit;
+  Buf := ASock.RecvBufferStr(NMethods, StubHandshakeTimeoutMs);
+  if (ASock.LastError <> 0) or (Length(Buf) < NMethods) then
+    Exit;
+  // Method choice mirrors the client configuration: user/pass when the stub
+  // expects credentials, no-auth otherwise.
+  if FStub.FAuthUser <> '' then
+    Method := 2
+  else
+    Method := 0;
+  Offered := False;
+  for I := 1 to NMethods do
+    if Ord(Buf[I]) = Method then
+      Offered := True;
+  if not Offered then
+  begin
+    ASock.SendString(#5 + AnsiChar($FF)); // no acceptable method
+    Exit;
+  end;
+  ASock.SendString(#5 + AnsiChar(Method));
+  // 2) RFC 1929 user/pass subnegotiation (VER, ULEN, UNAME, PLEN, PASSWD).
+  if Method = 2 then
+  begin
+    Buf := ASock.RecvBufferStr(2, StubHandshakeTimeoutMs);
+    if (ASock.LastError <> 0) or (Length(Buf) < 2) then
+      Exit;
+    ULen := Ord(Buf[2]);
+    Buf := ASock.RecvBufferStr(ULen, StubHandshakeTimeoutMs);
+    if ASock.LastError <> 0 then
+      Exit;
+    FStub.FAuthSeenUser := Buf;
+    Buf := ASock.RecvBufferStr(1, StubHandshakeTimeoutMs);
+    if ASock.LastError <> 0 then
+      Exit;
+    PLen := Ord(Buf[1]);
+    Buf := ASock.RecvBufferStr(PLen, StubHandshakeTimeoutMs);
+    if ASock.LastError <> 0 then
+      Exit;
+    FStub.FAuthSeenPass := Buf;
+    if (FStub.FAuthSeenUser <> FStub.FAuthUser) or
+       (FStub.FAuthSeenPass <> FStub.FAuthPass) then
+    begin
+      ASock.SendString(#1 + #1); // auth failure
+      Exit;
+    end;
+    ASock.SendString(#1 + #0);
+  end;
+  // 3) CONNECT: VER, CMD, RSV, ATYP, ADDR, PORT - the target is recorded but
+  // otherwise ignored.
+  Buf := ASock.RecvBufferStr(4, StubHandshakeTimeoutMs);
+  if (ASock.LastError <> 0) or (Length(Buf) < 4) or (Buf[1] <> #5) then
+    Exit;
+  ATyp := Ord(Buf[4]);
+  case ATyp of
+    1: AddrLen := 4;
+    4: AddrLen := 16;
+    3:
+      begin
+        Buf := ASock.RecvBufferStr(1, StubHandshakeTimeoutMs);
+        if (ASock.LastError <> 0) or (Length(Buf) < 1) then
+          Exit;
+        AddrLen := Ord(Buf[1]);
+      end;
+  else
+    Exit;
+  end;
+  Buf := ASock.RecvBufferStr(AddrLen + 2, StubHandshakeTimeoutMs);
+  if (ASock.LastError <> 0) or (Length(Buf) < AddrLen + 2) then
+    Exit;
+  PortWord := Word(Ord(Buf[AddrLen + 1]) shl 8) or Ord(Buf[AddrLen + 2]);
+  if ATyp = 1 then
+    FStub.FLastTarget := Format('%d.%d.%d.%d:%d',
+      [Ord(Buf[1]), Ord(Buf[2]), Ord(Buf[3]), Ord(Buf[4]), PortWord])
+  else if ATyp = 3 then
+    FStub.FLastTarget := Copy(Buf, 1, AddrLen) + ':' + IntToStr(PortWord)
+  else
+    FStub.FLastTarget := '<ipv6>';
+  Inc(FStub.FConnections);
+  // 4) CONNECT reply: VER, REP, RSV, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0.
+  ASock.SendString(#5 + AnsiChar(FStub.FConnectReply) + #0 + #1 + #0#0#0#0 + #0#0);
+  if FStub.FConnectReply <> 0 then
+    Exit;
+  // 5) The next canned HTTP response, regardless of the requested target.
+  if FStub.FResponses.Count > 0 then
+  begin
+    if FStub.FServed >= FStub.FResponses.Count then
+      Buf := FStub.FResponses[FStub.FResponses.Count - 1] // last repeats
+    else
+      Buf := FStub.FResponses[FStub.FServed];
+    Inc(FStub.FServed);
+    ASock.SendString(Buf);
+  end;
+  ASock.CloseSocket;
+end;
+
+{ TTestProxyClient }
+
+procedure TTestProxyClient.SetUp;
+begin
+  inherited SetUp;
+  FStub := TSOCKS5Stub.Create;
+  FClient := TRDAPClient.Create;
+  // Loopback only: the target host is 127.0.0.1 and the stub answers
+  // independently of the CONNECT target, so no DNS and no external network
+  // are involved; port 1 is not really connected to (the proxy intercepts).
+  FClient.BaseURL := 'http://127.0.0.1:1';
+  // Short timeouts: a misbehaving stub must fail the test fast, not hang it.
+  FClient.ConnectTimeout := 2000;
+  FClient.IOTimeout := 3000;
+end;
+
+procedure TTestProxyClient.TearDown;
+begin
+  FClient.Free;
+  FStub.Free;
+  inherited TearDown;
+end;
+
+// Builds a canned raw HTTP response with a correct Content-Length; the
+// Connection: close header makes Synapse drop the tunnel after the response.
+function TTestProxyClient.HTTPResponse(ACode: Integer; const AReason,
+  ABody: string; const AExtra: array of string): string;
+var
+  I: Integer;
+begin
+  Result := Format('HTTP/1.1 %d %s'#13#10, [ACode, AReason]) +
+    'Server: socks5-stub'#13#10 +
+    Format('Content-Length: %d'#13#10, [Length(ABody)]) +
+    'Connection: close'#13#10;
+  for I := 0 to High(AExtra) do
+    Result := Result + AExtra[I] + #13#10;
+  Result := Result + #13#10 + ABody;
+end;
+
+procedure TTestProxyClient.ConfigureProxy;
+begin
+  FClient.ProxyHost := '127.0.0.1';
+  FClient.ProxyPort := FStub.Port;
+end;
+
+procedure TTestProxyClient.TestProxyDefaults;
+var
+  C: TRDAPClient;
+begin
+  C := TRDAPClient.Create;
+  try
+    AssertEquals('no proxy host by default', '', C.ProxyHost);
+    AssertEquals('no proxy port by default', 0, C.ProxyPort);
+    AssertEquals('no proxy user by default', '', C.ProxyUser);
+    AssertEquals('no proxy pass by default', '', C.ProxyPass);
+  finally
+    C.Free;
+  end;
+end;
+
+procedure TTestProxyClient.TestProxy_200JSON;
+var
+  Body: string;
+begin
+  Body := '{"objectClassName":"ip","handle":"TEST-IP","name":"example"}';
+  FStub.Responses.Add(HTTPResponse(200, 'OK', Body, []));
+  ConfigureProxy;
+  FClient.QueryIP('192.0.2.1');
+  AssertTrue('status is rqsOK', FClient.LastStatus = rqsOK);
+  AssertEquals('HTTP code through the proxy', 200, FClient.LastHTTPCode);
+  AssertEquals('raw body through the proxy', Body, FClient.LastRawJSON);
+  AssertEquals('object parsed', 'ip', FClient.GetObjectType);
+  AssertEquals('one connection used', 1, FStub.Connections);
+  AssertTrue('CONNECT target is the request host',
+    Pos('127.0.0.1:1', FStub.LastTarget) > 0);
+end;
+
+procedure TTestProxyClient.TestProxy_429RetryAfter;
+begin
+  FStub.Responses.Add(HTTPResponse(429, 'Too Many Requests', '{"errorCode":429}',
+    ['Retry-After: 120']));
+  ConfigureProxy;
+  FClient.QueryIP('192.0.2.1');
+  AssertTrue('status is rqsRateLimited', FClient.LastStatus = rqsRateLimited);
+  AssertEquals('Retry-After seen through the proxy path', 120,
+    FClient.RetryAfter);
+end;
+
+procedure TTestProxyClient.TestProxy_ConnectRefused;
+var
+  Raised: Boolean;
+begin
+  FStub.Responses.Add(HTTPResponse(200, 'OK', '{}', []));
+  FStub.ConnectReply := 1; // general SOCKS server failure
+  ConfigureProxy;
+  Raised := False;
+  try
+    FClient.QueryIP('192.0.2.1');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions the proxy host', Pos('127.0.0.1', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+  AssertEquals('no HTTP code on a failed CONNECT', 0, FClient.LastHTTPCode);
+  AssertEquals('only one connection attempted', 1, FStub.Connections);
+end;
+
+procedure TTestProxyClient.TestProxy_Redirect302;
+var
+  Body: string;
+begin
+  Body := '{"objectClassName":"ip","handle":"MOVED","name":"example"}';
+  FStub.Responses.Add(HTTPResponse(302, 'Found', '',
+    ['Location: http://rdap.moved.example/registry/ip/192.0.2.1']));
+  FStub.Responses.Add(HTTPResponse(200, 'OK', Body, []));
+  ConfigureProxy;
+  FClient.QueryIP('192.0.2.1');
+  AssertTrue('status is rqsOK after the redirect', FClient.LastStatus = rqsOK);
+  AssertEquals('HTTP code of the final response', 200, FClient.LastHTTPCode);
+  AssertEquals('body of the final response', Body, FClient.LastRawJSON);
+  AssertEquals('redirect was a second pass over the wire', 2, FStub.Connections);
+  AssertTrue('second pass connects to the redirect target',
+    Pos('rdap.moved.example', FStub.LastTarget) > 0);
+  AssertEquals('LastURL stays the requested URL',
+    'http://127.0.0.1:1/ip/192.0.2.1', FClient.LastURL);
+end;
+
+procedure TTestProxyClient.TestProxy_RedirectRelativeLocation_Raises;
+var
+  Raised: Boolean;
+begin
+  FStub.Responses.Add(HTTPResponse(302, 'Found', '', ['Location: /ip/192.0.2.1']));
+  ConfigureProxy;
+  Raised := False;
+  try
+    FClient.QueryIP('192.0.2.1');
+  except
+    on E: ERDAPError do
+    begin
+      Raised := True;
+      AssertTrue('message mentions relative Location',
+        Pos('relative Location', E.Message) > 0);
+    end;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+  AssertEquals('no second pass after a relative Location', 1, FStub.Connections);
+end;
+
+procedure TTestProxyClient.TestProxy_UserPassAuth;
+var
+  Body: string;
+begin
+  Body := '{"objectClassName":"ip","handle":"AUTH","name":"example"}';
+  FStub.Responses.Add(HTTPResponse(200, 'OK', Body, []));
+  FStub.AuthUser := 'alice';
+  FStub.AuthPass := 'secret';
+  ConfigureProxy;
+  FClient.ProxyUser := 'alice';
+  FClient.ProxyPass := 'secret';
+  FClient.QueryIP('192.0.2.1');
+  AssertTrue('status is rqsOK with user/pass auth', FClient.LastStatus = rqsOK);
+  AssertEquals('username reached the proxy', 'alice', FStub.AuthSeenUser);
+  AssertEquals('password reached the proxy', 'secret', FStub.AuthSeenPass);
+end;
+
+procedure TTestProxyClient.TestProxy_AuthRejected;
+var
+  Raised: Boolean;
+begin
+  FStub.Responses.Add(HTTPResponse(200, 'OK', '{}', []));
+  FStub.AuthUser := 'alice';
+  FStub.AuthPass := 'secret';
+  ConfigureProxy;
+  FClient.ProxyUser := 'alice';
+  FClient.ProxyPass := 'wrong';
+  Raised := False;
+  try
+    FClient.QueryIP('192.0.2.1');
+  except
+    on E: ERDAPError do
+      Raised := True;
+    on E: Exception do
+      Fail('unexpected exception ' + E.ClassName + ': ' + E.Message);
+  end;
+  AssertTrue('ERDAPError expected', Raised);
+  AssertTrue('status is rqsError', FClient.LastStatus = rqsError);
+  AssertEquals('credentials were presented once', 'alice', FStub.AuthSeenUser);
+  AssertEquals('no HTTP code on a failed handshake', 0, FClient.LastHTTPCode);
+end;
+
 initialization
   RegisterTest(TTestIPUtils);
   RegisterTest(TTestBootstrap);
   RegisterTest(TTestRDAPClient);
+  RegisterTest(TTestProxyClient);
 
 end.

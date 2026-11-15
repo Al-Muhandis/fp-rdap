@@ -1269,13 +1269,20 @@ begin
           [URL, FProxyHost, FProxyPort, HTTP.Sock.LastErrorDesc]);
 
       // Last* snapshot: every hop overwrites it, so the final response is
-      // what ProcessLastResponse sees.
+      // what ProcessLastResponse sees. Synapse keeps raw wire lines too, but
+      // with the default '=' name/value separator (unlike
+      // TFPHttpClient.ResponseHeaders, which uses ':' and whose separator
+      // Assign copies over) - restore ':' so GetResponseHeader works for
+      // both transports.
       FResponseHeaders.Assign(HTTP.Headers);
+      FResponseHeaders.NameValueSeparator := ':';
       FLastHTTPCode := HTTP.ResultCode;
 
       if (HTTP.ResultCode >= 301) and (HTTP.ResultCode <= 308) then
       begin
-        Location := Trim(HTTP.Headers.Values['Location']);
+        // From the normalized snapshot (the raw Synapse Headers list keeps
+        // its '=' separator, so Values[] does not apply to it directly).
+        Location := GetResponseHeader('Location');
         if Location <> '' then
         begin
           if Hop >= MaxRedirects then
