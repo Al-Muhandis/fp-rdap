@@ -41,5 +41,8 @@ lib/
 !FpRdap.json
 !update_FpRdap.json
 
-# ZCode agent workspace (roadmap etc., local only)
+# Local-only session files (not part of the published repository):
+# agent instructions (AGENTS.md — kept out of git, may also live inside
+# .zcode/, which is ignored as a whole) and the roadmap in .zcode/
+AGENTS.md
 .zcode/
