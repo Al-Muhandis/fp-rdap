@@ -3,13 +3,13 @@
     "Name" : "FpRdap",
     "DisplayName" : "FpRdap",
     "Category" : "Networking",
-    "CommunityDescription" : "RDAP client library for Free Pascal: domain/IP/autnum/entity queries (RFC 9082/9083) routed via official IANA bootstrap files (RFC 8524/9224/9225), with IDNA punycode conversion of U-label domains (via fp-idn), RFC 9083 error-object parsing, Retry-After handling, response size limits, and a built-in mock client for offline unit tests.",
+    "CommunityDescription" : "RDAP client library for Free Pascal: domain/IP/autnum/entity queries (RFC 9082/9083) routed via official IANA bootstrap files (RFC 8524/9224/9225), with IDNA punycode conversion of U-label domains (via fp-idn), RFC 9083 error-object parsing, Retry-After handling, SOCKS5 proxy support (Synapse transport), response size limits, and a built-in mock client for offline unit tests.",
     "ExternalDependecies" : "",
     "OrphanedPackage" : 0,
     "RepositoryFileName" : "FpRdap.zip",
-    "RepositoryFileSize" : 88647,
-    "RepositoryFileHash" : "c700a1dfd4c736192a85405378a2993a",
-    "RepositoryDate" : 46340.91795138889,
+    "RepositoryFileSize" : 97119,
+    "RepositoryFileHash" : "eb9f937ff96ba3e01e97561f3a06445c",
+    "RepositoryDate" : 46345.0156712963,
     "PackageBaseDir" : "FpRdap\\/",
     "HomePageURL" : "https://github.com/al-muhandis/fp-rdap/",
     "DownloadURL" : "https://raw.githubusercontent.com/al-muhandis/fp-rdap/main/update_FpRdap.json",
@@ -18,16 +18,16 @@
   "PackageFiles0" : [
     {
       "Name" : "rdap_rt.lpk",
-      "Description" : "RDAP client library for Free Pascal: domain/IP/autnum/entity queries (RFC 9082/9083) routed via official IANA bootstrap files (RFC 8524/9224/9225), with IDNA punycode conversion of U-label domains (via fp-idn), RFC 9083 error-object parsing, Retry-After handling, response size limits, and a built-in mock client for offline unit tests.",
+      "Description" : "RDAP client library for Free Pascal: domain/IP/autnum/entity queries (RFC 9082/9083) routed via official IANA bootstrap files (RFC 8524/9224/9225), with IDNA punycode conversion of U-label domains (via fp-idn), RFC 9083 error-object parsing, Retry-After handling, SOCKS5 proxy support (Synapse transport), response size limits, and a built-in mock client for offline unit tests.",
       "Author" : "Renat Suleymanov (al-muhandis)",
       "License" : "MIT",
       "RelativeFilePath" : "",
-      "VersionAsString" : "1.0.0.0",
+      "VersionAsString" : "1.1.0.0",
       "LazCompatibility" : "2.0.0, 2.2.0, 2.2.4, 3.0.0, 3.4.0, 3.6.0, Trunk",
       "FPCCompatibility" : "3.2.0, 3.2.2, 3.2.4, 3.3",
       "SupportedWidgetSet" : "cocoa, gtk2, gtk3, qt5, qt6, win32/win64",
       "PackageType" : 3,
-      "DependenciesAsString" : "fpidn_rt,FCL"
+      "DependenciesAsString" : "fpidn_rt,laz_synapse,FCL"
     }
   ]
 }
