@@ -8,6 +8,19 @@ Manager); the release tag is `v<version>`. An entry is added for every
 release; observable behavior changes made during development are recorded
 in the README, "Changelog" section.
 
+## 1.1.0.1 — 2026-11-19
+
+English-first documentation, per the OPM maintainer's recommendation on the
+1.1.0.0 submission. No code changes: the library is identical to 1.1.0.0.
+
+### Changed
+
+- README.md and CHANGELOG.md are now English; the Russian text moved
+  unchanged to README.ru.md and CHANGELOG.ru.md, cross-linked via a
+  language switcher at the top of each file.
+- The OPM repository package (FpRdap.zip) ships both language variants of
+  the README and CHANGELOG from this release on.
+
 ## 1.1.0.0 — 2026-11-19
 
 SOCKS5 proxy in the transport (roadmap stage 6). The first release available
