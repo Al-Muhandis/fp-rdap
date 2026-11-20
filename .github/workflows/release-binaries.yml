@@ -59,13 +59,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir -p units
-          fpc -O3 -Xs -o${{ matrix.asset }} -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+          fpc -O3 -Xs -o"$GITHUB_WORKSPACE/${{ matrix.asset }}" -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
 
       - name: Build rdapcli (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & $env:FPC_EXE -O3 -Xs -o${{ matrix.asset }} -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+          & $env:FPC_EXE -O3 -Xs "-o$($env:GITHUB_WORKSPACE)\${{ matrix.asset }}" -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Attach to the GitHub release (tags only)
