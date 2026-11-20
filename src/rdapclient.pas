@@ -54,6 +54,14 @@ function TryParseRetryAfter(const AValue: string; out ASeconds: Integer): Boolea
   from an entity handle without extra context. The value is a suggestion only;
   callers may override it with an explicit type (e.g. rqtEntity). }
 function DetectQueryType(const AQuery: string): TRDAPQueryType;
+{ Folds an autonomous system number key to the asplain form required in the
+  RFC 9082 autnum path segment: an optional "AS" prefix (case-insensitive -
+  the notation users naturally type, e.g. "AS15169") followed by at least one
+  decimal digit is stripped. Anything else passes through unchanged - in
+  particular a bare "AS" or a non-numeric remainder is not touched, so no
+  valid key is mangled. QueryAutNum applies this before building the URL,
+  like QueryDomain folds U-labels to A-labels. }
+function AutNumToAsplain(const AAutNum: string): string;
 
 type
   { TRDAPBootstrap }
@@ -493,6 +501,18 @@ begin
   if SameText(Copy(Q, 1, 2), 'AS') and AllDigits(Copy(Q, 3, MaxInt)) then
     Exit(rqtAutNum);
   Result := rqtDomain;
+end;
+
+// See the interface comment. The live redirector rdap.org answers 404 for
+// /autnum/AS15169 and redirects /autnum/15169 to the authoritative server,
+// so the library folds the prefixed notation itself instead of leaving the
+// fix-up to callers.
+function AutNumToAsplain(const AAutNum: string): string;
+begin
+  Result := AAutNum;
+  if SameText(Copy(AAutNum, 1, 2), 'AS') and
+     AllDigits(Copy(AAutNum, 3, MaxInt)) then
+    Result := Copy(AAutNum, 3, MaxInt);
 end;
 
 function TryStrToIPv4(const S: string; out aIP: Cardinal): Boolean;
@@ -1474,7 +1494,10 @@ function TRDAPClient.QueryAutNum(const AAutNum: string): string;
 begin
   if Trim(AAutNum) = '' then
     raise ERDAPError.Create('AutNum is empty');
-  Result := ExecuteQuery('autnum/' + EncodePathSegment(Trim(AAutNum)), RequireBaseURL);
+  // RFC 9082 §3.1.2 puts an asplain number in the URL path: the natural
+  // "AS"-prefixed notation is folded here, like QueryDomain folds U-labels.
+  Result := ExecuteQuery('autnum/' +
+    EncodePathSegment(AutNumToAsplain(Trim(AAutNum))), RequireBaseURL);
 end;
 
 function TRDAPClient.QueryEntity(const AHandle: string): string;

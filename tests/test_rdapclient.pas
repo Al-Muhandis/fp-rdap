@@ -77,6 +77,7 @@ type
     procedure TestEncodePathSegment;
     procedure TestParseRetryAfter;
     procedure TestDetectQueryType;
+    procedure TestAutNumToAsplain;
   end;
 
   { TTestBootstrap - bootstrap file loading and server lookup }
@@ -144,6 +145,7 @@ type
     procedure TestQueryIP_InvalidIP;
     procedure TestQueryIP_UsesBootstrapBaseURL;
     procedure TestQueryAutNum;
+    procedure TestQueryAutNum_AsplainPassThrough;
     procedure TestQueryAutNum_NoBaseURL;
     procedure TestQueryEntity;
     procedure TestQueryEntity_EncodesPath;
@@ -539,6 +541,21 @@ begin
   AssertTrue('AS with a space inside', DetectQueryType('AS 15169') = rqtDomain);
   AssertTrue('IPv6 zone id rejected', DetectQueryType('fe80::1%eth0') = rqtDomain);
   AssertTrue('empty string falls back to domain', DetectQueryType('') = rqtDomain);
+end;
+
+// AS-prefix folding to the asplain key (RFC 9082 §3.1.2): only a full
+// "AS"+digits form is stripped, everything else passes through untouched.
+procedure TTestIPUtils.TestAutNumToAsplain;
+begin
+  AssertEquals('AS prefix stripped', '15169', AutNumToAsplain('AS15169'));
+  AssertEquals('lowercase prefix stripped', '0', AutNumToAsplain('as0'));
+  AssertEquals('mixed case prefix stripped', '0', AutNumToAsplain('As0'));
+  AssertEquals('plain number unchanged', '15169', AutNumToAsplain('15169'));
+  AssertEquals('bare AS unchanged', 'AS', AutNumToAsplain('AS'));
+  AssertEquals('non-numeric remainder unchanged', 'ASabc', AutNumToAsplain('ASabc'));
+  AssertEquals('space inside unchanged', 'AS 15169', AutNumToAsplain('AS 15169'));
+  AssertEquals('ASN not a prefix boundary', 'ASN15169', AutNumToAsplain('ASN15169'));
+  AssertEquals('empty unchanged', '', AutNumToAsplain(''));
 end;
 
 { TTestBootstrap }
@@ -1311,12 +1328,25 @@ begin
   end;
 end;
 
+// RFC 9082 §3.1.2 requires an asplain number in the autnum path: the natural
+// "AS"-prefixed notation is folded by the client (rdap.org answers 404 for
+// the prefixed form).
 procedure TTestRDAPClient.TestQueryAutNum;
 begin
   FClient.BaseURL := 'https://rdap.db.ripe.net';
   FClient.SetupMock('{"objectClassName":"autnum"}');
   FClient.QueryAutNum('AS3356');
-  AssertEquals('request URL', 'https://rdap.db.ripe.net/autnum/AS3356', FClient.LastURL);
+  AssertEquals('request URL with folded AS prefix',
+    'https://rdap.db.ripe.net/autnum/3356', FClient.LastURL);
+end;
+
+procedure TTestRDAPClient.TestQueryAutNum_AsplainPassThrough;
+begin
+  FClient.BaseURL := 'https://rdap.db.ripe.net';
+  FClient.SetupMock('{"objectClassName":"autnum"}');
+  FClient.QueryAutNum('15169');
+  AssertEquals('plain number passes through',
+    'https://rdap.db.ripe.net/autnum/15169', FClient.LastURL);
 end;
 
 procedure TTestRDAPClient.TestQueryAutNum_NoBaseURL;

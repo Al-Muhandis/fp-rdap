@@ -308,16 +308,6 @@ begin
     AOpts.QueryType := DetectQueryType(AOpts.Query);
 end;
 
-// RFC 9082 §3.1.2 wants an asplain number (no prefix) in the autnum path
-// segment: strip the optional "AS" prefix a user naturally types.
-function AutNumPathValue(const AQuery: string): string;
-begin
-  if SameText(Copy(AQuery, 1, 2), 'AS') then
-    Result := Copy(AQuery, 3, MaxInt)
-  else
-    Result := AQuery;
-end;
-
 // Bootstrap file name for ADir: '' loads from the current directory (plain
 // names, like the demo), otherwise from the given directory.
 function BootstrapFilePath(const ADir, AName: string): string;
@@ -431,7 +421,7 @@ begin
     try
       case AOpts.QueryType of
         rqtIP:     C.QueryIP(Query);
-        rqtAutNum: C.QueryAutNum(AutNumPathValue(Query));
+        rqtAutNum: C.QueryAutNum(Query); // the client folds the AS prefix itself
         rqtEntity: C.QueryEntity(Query);
       else
         C.QueryDomain(Query);
