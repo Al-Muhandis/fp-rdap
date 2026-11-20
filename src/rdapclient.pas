@@ -15,6 +15,10 @@ type
 
   TRDAPQueryStatus = (rqsNone, rqsOK, rqsNotFound, rqsRateLimited, rqsError);
 
+  { The RDAP lookup types (RFC 9082): which object kind a query targets -
+    the URL path segment "domain"/"ip"/"autnum"/"entity". }
+  TRDAPQueryType = (rqtDomain, rqtIP, rqtAutNum, rqtEntity);
+
 { Pure helper functions. They are exposed in the interface so unit tests can cover IP parsing, CIDR matching,
   domain suffix matching and path encoding without any network or filesystem access. }
 
@@ -43,6 +47,13 @@ function EncodePathSegment(const S: string): string;
   delay in whole seconds; a date in the past yields 0. False (and ASeconds = 0)
   for an empty or unparseable value. }
 function TryParseRetryAfter(const AValue: string; out ASeconds: Integer): Boolean;
+{ Suggests the query type for a free-form query string: a valid IPv4/IPv6
+  literal (exactly the syntax QueryIP accepts) yields rqtIP, "AS" followed by
+  decimal digits (case-insensitive) yields rqtAutNum, everything else - the
+  empty string included - rqtDomain, since a domain name cannot be told apart
+  from an entity handle without extra context. The value is a suggestion only;
+  callers may override it with an explicit type (e.g. rqtEntity). }
+function DetectQueryType(const AQuery: string): TRDAPQueryType;
 
 type
   { TRDAPBootstrap }
@@ -457,7 +468,31 @@ begin
     ASeconds := Integer(Secs);
     Exit(True);
   end;
-  Result := False;
+    Result := False;
+end;
+
+// See the interface comment. The IP check mirrors QueryIP's own validation
+// (':' switches to the IPv6 parser), so auto-detection and the query method
+// agree on what counts as an IP literal.
+function DetectQueryType(const AQuery: string): TRDAPQueryType;
+var
+  Q: string;
+  V4: Cardinal;
+  V6: TIPv6Bytes;
+begin
+  Q := Trim(AQuery);
+  if Pos(':', Q) > 0 then
+  begin
+    if TryStrToIPv6(Q, V6) then
+      Exit(rqtIP);
+  end
+  else if TryStrToIPv4(Q, V4) then
+    Exit(rqtIP);
+  // "AS" + decimal digits is the autnum key; a bare "AS" (no digits) is not -
+  // "as" is a real TLD.
+  if SameText(Copy(Q, 1, 2), 'AS') and AllDigits(Copy(Q, 3, MaxInt)) then
+    Exit(rqtAutNum);
+  Result := rqtDomain;
 end;
 
 function TryStrToIPv4(const S: string; out aIP: Cardinal): Boolean;

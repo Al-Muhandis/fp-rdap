@@ -76,6 +76,7 @@ type
     procedure TestDomainToASCII;
     procedure TestEncodePathSegment;
     procedure TestParseRetryAfter;
+    procedure TestDetectQueryType;
   end;
 
   { TTestBootstrap - bootstrap file loading and server lookup }
@@ -510,6 +511,34 @@ begin
   AssertFalse('date without GMT', TryParseRetryAfter('Sat, 01 Jan 2050 00:00:00 UTC', S));
   AssertFalse('obsolete RFC 850 date', TryParseRetryAfter('Sunday, 06-Nov-94 08:49:37 GMT', S));
   AssertFalse('bad month', TryParseRetryAfter('Sun, 06 Foo 1994 08:49:37 GMT', S));
+end;
+
+// Query type auto-detection: the IP cases must agree with what QueryIP
+// accepts (same parsers), the autnum rule is "AS" + digits, everything else
+// falls back to a domain (a handle cannot be told apart from a domain name).
+procedure TTestIPUtils.TestDetectQueryType;
+begin
+  // IP literals
+  AssertTrue('IPv4', DetectQueryType('8.8.8.8') = rqtIP);
+  AssertTrue('IPv4 trimmed', DetectQueryType(' 192.0.2.1 ') = rqtIP);
+  AssertTrue('IPv6 compressed', DetectQueryType('2001:db8::1') = rqtIP);
+  AssertTrue('IPv6 full form', DetectQueryType('2001:db8:0:1:2:3:4:5') = rqtIP);
+  AssertTrue('IPv6 loopback', DetectQueryType('::1') = rqtIP);
+  AssertTrue('IPv6 embedded IPv4', DetectQueryType('::ffff:192.0.2.1') = rqtIP);
+  // AutNum: "AS" + digits, case-insensitive prefix
+  AssertTrue('AS upper', DetectQueryType('AS15169') = rqtAutNum);
+  AssertTrue('AS lower', DetectQueryType('as15169') = rqtAutNum);
+  AssertTrue('AS trimmed', DetectQueryType(' AS0 ') = rqtAutNum);
+  // Domain fallback: not an IP, not "AS" + digits
+  AssertTrue('plain domain', DetectQueryType('example.ru') = rqtDomain);
+  AssertTrue('invalid IPv4 (out of range octet)', DetectQueryType('256.1.1.1') = rqtDomain);
+  AssertTrue('incomplete IPv4', DetectQueryType('1.2.3') = rqtDomain);
+  AssertTrue('bare digits are a domain', DetectQueryType('15169') = rqtDomain);
+  AssertTrue('AS without digits ("as" is a TLD)', DetectQueryType('AS') = rqtDomain);
+  AssertTrue('AS with trailing letters', DetectQueryType('AS15169X') = rqtDomain);
+  AssertTrue('AS with a space inside', DetectQueryType('AS 15169') = rqtDomain);
+  AssertTrue('IPv6 zone id rejected', DetectQueryType('fe80::1%eth0') = rqtDomain);
+  AssertTrue('empty string falls back to domain', DetectQueryType('') = rqtDomain);
 end;
 
 { TTestBootstrap }
