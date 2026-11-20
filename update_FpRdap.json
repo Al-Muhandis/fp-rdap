@@ -1,15 +1,15 @@
 {
   "UpdatePackageData" : {
     "DisableInOPM" : false,
-    "DownloadZipURL" : "https://github.com/al-muhandis/fp-rdap/archive/refs/tags/v1.1.0.1.zip",
-    "Name" : "v1.1.0.1.zip"
+    "DownloadZipURL" : "https://github.com/al-muhandis/fp-rdap/archive/refs/tags/v1.2.0.0.zip",
+    "Name" : "v1.2.0.0.zip"
   },
   "UpdatePackageFiles" : [
     {
       "ForceNotify" : false,
-      "InternalVersion" : 1010001,
+      "InternalVersion" : 1020000,
       "Name" : "rdap_rt.lpk",
-      "Version" : "1.1.0.1"
+      "Version" : "1.2.0.0"
     }
   ]
 }

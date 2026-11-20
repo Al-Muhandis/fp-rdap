@@ -8,11 +8,11 @@ Manager); the release tag is `v<version>`. An entry is added for every
 release; observable behavior changes made during development are recorded
 in the README, "Changelog" section.
 
-## Unreleased
+## 1.2.0.0 — 2026-11-21
 
-New: the `rdapcli` console utility. The package version and the OPM
-artifacts are deliberately untouched here — the release steps (version
-bump, tag, manifest rebuild) happen separately.
+The `rdapcli` console utility — a whois-style front end to the library —
+plus the asplain normalization of the autnum key. The GitHub release ships
+prebuilt rdapcli binaries (a Windows exe and a Linux ELF), built by CI.
 
 ### Added
 
