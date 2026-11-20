@@ -54,6 +54,8 @@ FILES = [
     "README.ru.md",
     "CHANGELOG.md",
     "CHANGELOG.ru.md",
+    "cli/rdapcli.lpi",
+    "cli/rdapcli.lpr",
     "demo/rdap_demo.lpi",
     "demo/rdap_demo.lpr",
     "tests/test_rdapclient.pas",
