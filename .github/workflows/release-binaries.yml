@@ -51,55 +51,54 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The dedicated fpc-3.2.2.win64.exe no longer exists on SourceForge:
-          # the release folder was renamed to Win32/3.2.2/ and the file is now
-          # the combined fpc-3.2.2.win32.and.win64.exe. Datacenter IPs (CI
-          # runners) get an HTML interstitial page from the generic
-          # downloads.sourceforge.net endpoint, so direct
-          # <mirror>.dl.sourceforge.net URLs are tried first; every download
-          # is validated (size + MZ header) before it is executed.
-          $urls = @(
-            'https://master.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
-            'https://phoenixnap.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
-            'https://altushost-swe.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
-            'https://cfhcable.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
-            'https://cytranet-dal.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
-            'https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe?viasf=1'
-          )
-          $ok = $false
-          foreach ($url in $urls) {
-            "Trying $url"
-            try { Invoke-WebRequest -Uri $url -OutFile fpcsetup.exe -MaximumRedirection 10 -TimeoutSec 600 } catch { "Download failed: $_"; continue }
-            $size = (Get-Item fpcsetup.exe).Length
-            "Downloaded $size bytes"
-            if ($size -lt 50MB) { continue }
-            $fs = [System.IO.File]::OpenRead('fpcsetup.exe')
-            $mz = [byte[]]::new(2)
-            $fs.Read($mz, 0, 2) | Out-Null
-            $fs.Close()
-            if ($mz[0] -eq 0x4D -and $mz[1] -eq 0x5A) { $ok = $true; break }
+          # SourceForge is unusable from CI: datacenter IPs get an HTML
+          # interstitial instead of the file from every mirror, the dedicated
+          # win64 installer was renamed away, and the silent win32+cross
+          # installer pair from downloads.freepascal.org installs nothing in
+          # VERYSILENT mode. The official portable tree of the 3.2.2 release
+          # (no installer involved) works instead: it ships ppcx64.exe, its
+          # own binutils and the precompiled win64 units.
+          New-Item -ItemType Directory -Force fpc322 | Out-Null
+          Set-Location fpc322
+          Invoke-WebRequest -Uri 'https://downloads.freepascal.org/fpc/dist/3.2.2/x86_64-win64/fpc-3.2.2.x86_64-win64.tar' -OutFile fpc.tar -TimeoutSec 900
+          tar -xf fpc.tar
+          tar -xf fpc-3.2.2.x86_64-win64/binary.x86_64-win64.tar
+          tar -xzf x86_64-win64-base.x86_64-linux.tar.gz
+          foreach ($pkg in 'rtl-console','rtl-extra','rtl-generics','rtl-objpas','rtl-unicode','fcl-base','fcl-json','fcl-net','fcl-web','openssl','hash','paszlib','regexpr','zlib') {
+            tar -xzf "units-$pkg.x86_64-win64.tar.gz"
           }
-          if (-not $ok) { exit 1 }
-          Start-Process -Wait -PassThru -FilePath .\fpcsetup.exe -ArgumentList '/SP-','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\FPC' | ForEach-Object { if ($_.ExitCode -ne 0) { exit $_.ExitCode } }
-          if (-not (Test-Path 'C:\FPC\bin\x86_64-win64\fpc.exe')) { Get-ChildItem C:\FPC -Recurse | Select-Object -ExpandProperty FullName; exit 1 }
-          # The silent installer normally writes fpc.cfg into the compiler bin
-          # directory; regenerate it as a fallback in case that step is skipped.
-          if (-not (Test-Path 'C:\FPC\bin\x86_64-win64\fpc.cfg')) {
-            & C:\FPC\bin\x86_64-win64\fpcmkcfg.exe -d 'basepath=C:\FPC' -o C:\FPC\bin\x86_64-win64\fpc.cfg
-          }
-          "FPC_EXE=C:\FPC\bin\x86_64-win64\fpc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # The core RTL lands in units\x86_64-win64 while the package units
+          # go to lib\fpc\3.2.2\units\x86_64-win64 - merge for a single -Fu root.
+          Move-Item units\x86_64-win64\rtl lib\fpc\3.2.2\units\x86_64-win64\rtl
+          Remove-Item units -Recurse -Force
+          $fpcExe = "$PWD\bin\x86_64-win64\ppcx64.exe"
+          if (-not (Test-Path $fpcExe)) { Get-ChildItem -Recurse -Depth 2 | Select-Object -ExpandProperty FullName; exit 1 }
+          $ver = (& $fpcExe -iV | Out-String).Trim()
+          "FPC version: $ver"
+          if ($ver -ne '3.2.2') { exit 1 }
+          "FPC_EXE=$fpcExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "FPC_UNITROOT=$PWD\lib\fpc\3.2.2\units\x86_64-win64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build rdapcli (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p units
-          fpc -O3 -Xs -o"$GITHUB_WORKSPACE/${{ matrix.asset }}" -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+          fpc -Sc -O3 -Xs -o"$GITHUB_WORKSPACE/${{ matrix.asset }}" -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
 
       - name: Build rdapcli (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & $env:FPC_EXE -O3 -Xs "-o$($env:GITHUB_WORKSPACE)\${{ matrix.asset }}" -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+          # -Sc enables the C-style compound operators (+= etc.) used by
+          # fp-idn: the 3.2.2 release compiler does not turn them on in
+          # objfpc mode by default (the Debian/apt build the Linux job uses
+          # is a later fixes snapshot and accepts them as-is).
+          New-Item -ItemType Directory -Force units | Out-Null
+          $pkgs = 'rtl','rtl-console','rtl-extra','rtl-generics','rtl-objpas','rtl-unicode','fcl-base','fcl-json','fcl-net','fcl-web','openssl','hash','paszlib','regexpr','zlib'
+          $argList = @('-Sc','-O3','-Xs',"-o$($env:GITHUB_WORKSPACE)\${{ matrix.asset }}")
+          foreach ($pkg in $pkgs) { $argList += "-Fu$($env:FPC_UNITROOT)\$pkg" }
+          $argList += @('-Fusrc','-Fu..\fp-idn','-Fu..\synapse','-FUunits','cli\rdapcli.lpr')
+          & $env:FPC_EXE @argList
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Attach to the GitHub release (tags only)
