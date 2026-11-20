@@ -8,6 +8,31 @@ Manager); the release tag is `v<version>`. An entry is added for every
 release; observable behavior changes made during development are recorded
 in the README, "Changelog" section.
 
+## Unreleased
+
+New: the `rdapcli` console utility. The package version and the OPM
+artifacts are deliberately untouched here — the release steps (version
+bump, tag, manifest rebuild) happen separately.
+
+### Added
+
+- `cli/rdapcli.lpi` — a console whois-style front end to the library:
+  auto-detected query type (a valid IPv4/IPv6 literal → `ip`, `AS` + digits →
+  `autnum`, anything else → `domain`; `--type=` override for entity handles),
+  `--raw` output of the response body to stdout, `--bootstrap-dir=DIR` with
+  the `https://rdap.org/` fallback, SOCKS5 options `--proxy=host:port` /
+  `--proxy-user=` / `--proxy-pass=`, English `-h`/`--help`. Exit codes:
+  0 — ok, 1 — not found (HTTP 404), 2 — rate limited (HTTP 429, with
+  `Retry-After`), 3 — everything else. Results go to stdout, notices and
+  errors to stderr. On Windows the UTF-8 arguments are parsed from the wide
+  (UTF-16) command line — the RTL `ParamStr` goes through the system ANSI
+  codepage and mangles non-ASCII queries (e.g. IDN domains) on hosts whose
+  system codepage cannot represent them.
+- `TRDAPQueryType` and the pure helper `DetectQueryType` (exported per the
+  helpers-for-tests convention): query type auto-detection built on the
+  exported IP parsers — the same syntax `QueryIP` accepts. Tests: 81 (one
+  new).
+
 ## 1.1.0.1 — 2026-11-19
 
 English-first documentation, per the OPM maintainer's recommendation on the

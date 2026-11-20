@@ -33,6 +33,7 @@ bootstrap files ([RFC 8524], [RFC 9224], [RFC 9225]).
 | `rdap_rt.lpk` | Lazarus package (runtime-only) |
 | `tests/` | FPCUnit tests: console and GUI runners |
 | `demo/` | Console demo |
+| `cli/` | `rdapcli` console utility |
 
 ## Installation
 
@@ -113,6 +114,48 @@ rdap_demo --proxy=127.0.0.1:1080 --proxy-user=u --proxy-pass=p
 
 Without `--proxy` the demo goes direct, as before.
 
+## Command-line utility
+
+`cli/rdapcli.lpi` builds `rdapcli` — a console whois-style front end to the
+library (no GUI, no interactive prompts, script-friendly exit codes):
+
+```bash
+C:\laz-4.8\lazarus\lazbuild.exe --pcp=C:\laz-4.8\config_lazarus cli\rdapcli.lpi
+```
+
+The query type is detected automatically: a valid IPv4/IPv6 address → `ip`,
+`AS` + digits → `autnum` (the `AS` prefix is stripped — RFC 9082 wants an
+asplain number in the path), anything else → `domain`; `--type=` overrides
+it, e.g. for entity handles, which cannot be detected.
+
+```bash
+rdapcli example.ru                       # domain
+rdapcli 8.8.8.8                          # IP
+rdapcli AS15169                          # autonomous system
+rdapcli 2001:db8::1                      # IPv6
+rdapcli --type=entity NIC-HDL-ANR30-RIPE # explicit type
+rdapcli --raw example.com > result.json  # raw JSON body into a file
+rdapcli --bootstrap-dir=C:\rdap example.com  # IANA bootstrap from a directory
+rdapcli --proxy=127.0.0.1:9050 example.com   # via a SOCKS5 proxy
+```
+
+- `--bootstrap-dir=DIR` points at a directory with the IANA bootstrap files
+  `dns.json`/`ipv4.json`/`ipv6.json` (default: the current directory, like the
+  demo); without them the queries go through `https://rdap.org/`. The utility
+  never downloads the bootstrap from the network — the library has no such
+  API by design.
+- Exit codes: `0` — success (`rqsOK`); `1` — object not found (`rqsNotFound`,
+  HTTP 404); `2` — rate limited (`rqsRateLimited`, HTTP 429, the summary
+  includes `Retry-After`); `3` — everything else (RDAP error status, network
+  failure, invalid query, usage error).
+- Results go to stdout; notices and errors go to stderr — so
+  `rdapcli --raw example.com > file.json` captures exactly the response body.
+- On Windows the console output is switched to UTF-8 for the run (like the
+  demo), and the command line is parsed from the wide (UTF-16) command line
+  into UTF-8 arguments: the RTL `ParamStr` goes through the system ANSI
+  codepage and mangles non-ASCII queries (e.g. IDN domains) on hosts whose
+  system codepage cannot represent them.
+
 ## Limitations
 
 - The client is not thread-safe: one instance per thread.
@@ -145,6 +188,29 @@ MIT — see [LICENSE](LICENSE).
 ## Changelog
 
 Release history — in [CHANGELOG.md](CHANGELOG.md).
+
+### 2026-11-20 — rdapcli console utility
+
+- New: `cli/rdapcli.lpi` — a console whois-style front end to the library.
+  The first positional argument is the query; its type is auto-detected (a
+  valid IPv4/IPv6 literal → `ip`, `AS` + digits → `autnum`, anything else →
+  `domain`), `--type=` overrides it for entity handles.
+- Options: `--raw` (the response body as-is on stdout — only the JSON is
+  printed, suitable for redirection), `--bootstrap-dir=DIR` (IANA bootstrap
+  files from a directory; the default is the current directory; without them
+  the queries go through `https://rdap.org/`), `--proxy=host:port` /
+  `--proxy-user=` / `--proxy-pass=` (SOCKS5), `-h`/`--help`.
+- Exit codes: 0 — ok; 1 — not found (HTTP 404); 2 — rate limited (HTTP 429,
+  with `Retry-After`); 3 — everything else. Results go to stdout, notices
+  and errors to stderr.
+- Windows: the console output switches to UTF-8 for the run (like the demo),
+  and the command line is parsed from the wide (UTF-16) command line and
+  converted to UTF-8 — RTL `ParamStr` goes through the system ANSI codepage
+  and mangles non-ASCII queries (e.g. IDN domains) on hosts whose system
+  codepage cannot represent them.
+- The library exposes the `TRDAPQueryType` type and a new pure helper
+  `DetectQueryType` (per the helpers-for-tests convention; the autodetect
+  rule agrees with what `QueryIP` accepts). Tests: 81 (one new).
 
 ### 2026-11-15 — SOCKS5 proxy in the transport (roadmap stage 6)
 
