@@ -1,0 +1,85 @@
+name: Release binaries
+
+# Builds the rdapcli console utility and attaches the binaries to the GitHub
+# release on version tags: a Windows exe (x64) and a Linux ELF (x86_64,
+# glibc). On workflow_dispatch the job only builds and uploads workflow
+# artifacts, so the pipeline can be validated without touching a release.
+#
+# Plain FPC build (no Lazarus IDE in CI): the project tree compiles with unit
+# paths only - src/rdapclient, the sibling fp-idn repository (punycode for
+# IDNA) and the Synapse repository (SOCKS5 proxy transport), mirroring the
+# local build recipe. HTTPS at runtime needs OpenSSL libraries in PATH (the
+# same requirement as the library; the DLLs/so are not bundled here).
+#
+# The release itself (manifest commit, release notes) is created by
+# opm-update.yml on the same tag push; the attach step below is idempotent
+# (create-if-missing) so the two workflows can race safely.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rdapcli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: rdapcli-linux-x86_64
+          - os: windows-latest
+            asset: rdapcli-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone fp-idn and Synapse
+        run: |
+          git clone --depth 1 https://github.com/Al-Muhandis/fp-idn.git ../fp-idn
+          git clone --depth 1 https://github.com/geby/synapse.git ../synapse
+
+      - name: Install FPC (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q fpc
+
+      - name: Install FPC 3.2.2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://sourceforge.net/projects/freepascal/files/Win32/FreePascal%203.2.2/fpc-3.2.2.win64.exe/download' -OutFile fpcsetup.exe -MaximumRedirection 10
+          Start-Process -Wait -FilePath .\fpcsetup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\FPC'
+          "FPC_EXE=C:\FPC\bin\x86_64-win64\fpc.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build rdapcli (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p units
+          fpc -O3 -Xs -o${{ matrix.asset }} -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+
+      - name: Build rdapcli (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & $env:FPC_EXE -O3 -Xs -o${{ matrix.asset }} -Fusrc -Fu../fp-idn -Fu../synapse -FUunits cli/rdapcli.lpr
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Attach to the GitHub release (tags only)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 || \
+            gh release create "${{ github.ref_name }}" --title "fp-rdap ${{ github.ref_name }}" --generate-notes || true
+          gh release upload "${{ github.ref_name }}" "${{ matrix.asset }}" --clobber
+
+      - name: Upload as a workflow artifact (validation runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
