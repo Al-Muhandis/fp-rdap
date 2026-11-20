@@ -53,19 +53,33 @@ jobs:
         run: |
           # The dedicated fpc-3.2.2.win64.exe no longer exists on SourceForge:
           # the release folder was renamed to Win32/3.2.2/ and the file is now
-          # the combined fpc-3.2.2.win32.and.win64.exe. SourceForge error pages
-          # arrive with HTTP 200, so the payload is verified (size + MZ header)
-          # before running, otherwise a stray HTML page gets executed below.
-          $url = 'https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe?viasf=1'
-          Invoke-WebRequest -Uri $url -OutFile fpcsetup.exe -MaximumRedirection 10
-          $size = (Get-Item fpcsetup.exe).Length
-          "Downloaded $size bytes"
-          if ($size -lt 50MB) { exit 1 }
-          $fs = [System.IO.File]::OpenRead('fpcsetup.exe')
-          $mz = [byte[]]::new(2)
-          $fs.Read($mz, 0, 2) | Out-Null
-          $fs.Close()
-          if ($mz[0] -ne 0x4D -or $mz[1] -ne 0x5A) { exit 1 }
+          # the combined fpc-3.2.2.win32.and.win64.exe. Datacenter IPs (CI
+          # runners) get an HTML interstitial page from the generic
+          # downloads.sourceforge.net endpoint, so direct
+          # <mirror>.dl.sourceforge.net URLs are tried first; every download
+          # is validated (size + MZ header) before it is executed.
+          $urls = @(
+            'https://master.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
+            'https://phoenixnap.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
+            'https://altushost-swe.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
+            'https://cfhcable.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
+            'https://cytranet-dal.dl.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe',
+            'https://downloads.sourceforge.net/project/freepascal/Win32/3.2.2/fpc-3.2.2.win32.and.win64.exe?viasf=1'
+          )
+          $ok = $false
+          foreach ($url in $urls) {
+            "Trying $url"
+            try { Invoke-WebRequest -Uri $url -OutFile fpcsetup.exe -MaximumRedirection 10 -TimeoutSec 600 } catch { "Download failed: $_"; continue }
+            $size = (Get-Item fpcsetup.exe).Length
+            "Downloaded $size bytes"
+            if ($size -lt 50MB) { continue }
+            $fs = [System.IO.File]::OpenRead('fpcsetup.exe')
+            $mz = [byte[]]::new(2)
+            $fs.Read($mz, 0, 2) | Out-Null
+            $fs.Close()
+            if ($mz[0] -eq 0x4D -and $mz[1] -eq 0x5A) { $ok = $true; break }
+          }
+          if (-not $ok) { exit 1 }
           Start-Process -Wait -PassThru -FilePath .\fpcsetup.exe -ArgumentList '/SP-','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\FPC' | ForEach-Object { if ($_.ExitCode -ne 0) { exit $_.ExitCode } }
           if (-not (Test-Path 'C:\FPC\bin\x86_64-win64\fpc.exe')) { Get-ChildItem C:\FPC -Recurse | Select-Object -ExpandProperty FullName; exit 1 }
           # The silent installer normally writes fpc.cfg into the compiler bin
