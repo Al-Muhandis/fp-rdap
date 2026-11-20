@@ -103,6 +103,10 @@ jobs:
 
       - name: Attach to the GitHub release (tags only)
         if: github.ref_type == 'tag'
+        # The step is bash-only (>, ||, line continuations); without an
+        # explicit shell the Windows runner runs it in pwsh, which turned
+        # >/dev/null into a file write to D:\dev\null on the first tag run.
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
