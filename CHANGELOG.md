@@ -30,8 +30,19 @@ bump, tag, manifest rebuild) happen separately.
   system codepage cannot represent them.
 - `TRDAPQueryType` and the pure helper `DetectQueryType` (exported per the
   helpers-for-tests convention): query type auto-detection built on the
-  exported IP parsers — the same syntax `QueryIP` accepts. Tests: 81 (one
-  new).
+  exported IP parsers — the same syntax `QueryIP` accepts.
+- The pure helper `AutNumToAsplain`: folds the optional case-insensitive
+  "AS" prefix followed by digits to the asplain key required in the RFC
+  9082 autnum path segment; anything else passes through unchanged.
+
+### Changed
+
+- **Behavior change:** `QueryAutNum` normalizes the query key to the
+  asplain form required by RFC 9082 §3.1.2 (via `AutNumToAsplain`, like
+  `QueryDomain` folds U-labels to A-labels): `QueryAutNum('AS15169')`
+  queries `autnum/15169`, previously `autnum/AS15169` — a form redirectors
+  like rdap.org answer with 404. The rdapcli utility dropped its own
+  folding accordingly. Tests: 83 (three new, one updated).
 
 ## 1.1.0.1 — 2026-11-19
 

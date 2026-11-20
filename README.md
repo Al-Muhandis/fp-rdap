@@ -189,6 +189,22 @@ MIT — see [LICENSE](LICENSE).
 
 Release history — in [CHANGELOG.md](CHANGELOG.md).
 
+### 2026-11-21 — QueryAutNum folds the AS prefix to the asplain form
+
+- **Behavior change:** `QueryAutNum` now normalizes the query key to the
+  asplain form required by RFC 9082 §3.1.2: an optional case-insensitive
+  "AS" prefix followed by at least one digit is stripped —
+  `QueryAutNum('AS15169')` queries `autnum/15169`, previously
+  `autnum/AS15169`, which redirectors like rdap.org answer with 404 ("No
+  RDAP service is available"). Keys without the prefix pass through
+  unchanged, and so do a bare "AS" or a non-numeric remainder — no valid
+  key is mangled.
+- The folding is the new pure helper `AutNumToAsplain` (exported per the
+  helpers-for-tests convention), applied like `QueryDomain` folds U-labels
+  to A-labels. The rdapcli utility dropped its own folding — the fix-up now
+  comes from the library, so every `QueryAutNum` caller benefits.
+- Tests: 83 (two new, one updated).
+
 ### 2026-11-20 — rdapcli console utility
 
 - New: `cli/rdapcli.lpi` — a console whois-style front end to the library.
